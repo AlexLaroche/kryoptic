@@ -11,7 +11,26 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{LazyLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+#[cfg(all(feature = "ossl-backend", feature = "awslc"))]
+compile_error!("features `ossl-backend` and `awslc` are mutually exclusive");
+#[cfg(all(feature = "ossl-backend", feature = "awslc-fips"))]
+compile_error!(
+    "features `ossl-backend` and `awslc-fips` are mutually exclusive"
+);
+#[cfg(all(feature = "awslc", feature = "awslc-fips"))]
+compile_error!("features `awslc` and `awslc-fips` are mutually exclusive");
+#[cfg(not(any(
+    feature = "ossl-backend",
+    feature = "awslc",
+    feature = "awslc-fips"
+)))]
+compile_error!(
+    "exactly one crypto backend must be enabled: `ossl-backend` (default), `awslc`, or `awslc-fips`"
+);
+
 mod attribute;
+#[cfg(any(feature = "awslc", feature = "awslc-fips"))]
+mod awslc;
 mod config;
 mod defaults;
 mod encryption;
@@ -21,7 +40,27 @@ mod mechanism;
 mod misc;
 mod native;
 mod object;
+#[cfg(feature = "ossl-backend")]
 mod ossl;
+// When the `awslc` or `awslc-fips` feature is enabled, `crate::ossl` is
+// bound to the awslc-backed module tree instead of the OpenSSL-backed
+// one, so every existing `crate::ossl::...` reference (src/hash.rs,
+// src/rng.rs, ...) resolves to whichever backend is active without
+// needing to change those call sites per backend.
+#[cfg(any(feature = "awslc", feature = "awslc-fips"))]
+use awslc as ossl;
+// `src/awslc/*.rs` itself references the *external* low-level crate
+// (`awslc` or `awslc-fips`) directly by name in ~27 call sites. Cargo
+// can't rename two different crates to the same local name in one
+// manifest, so this alias exists to give those call sites one name
+// (`crate::lowlevel`) regardless of which low-level crate backs it.
+// A leading `::` forces resolution through the extern prelude, bypassing
+// the local `mod awslc;` above, which would otherwise shadow the extern
+// crate of the same name (as `use awslc as ossl;` above relies on).
+#[cfg(feature = "awslc")]
+use ::awslc as lowlevel;
+#[cfg(feature = "awslc-fips")]
+use ::awslc_fips as lowlevel;
 mod rng;
 mod session;
 mod slot;
@@ -99,7 +138,7 @@ pub(crate) struct State {
 impl State {
     /// Initializes the global state. Clears existing slots and sessions.
     pub(crate) fn initialize(&mut self) {
-        #[cfg(feature = "fips")]
+        #[cfg(all(feature = "fips", feature = "ossl-backend"))]
         fips::provider::init();
 
         self.slots.clear();

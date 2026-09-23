@@ -161,7 +161,10 @@ jobs:
           elif [ "${{ matrix.linking }}" = "static" ]; then
             FEATURES="${FEATURES},${FEATURE_SET},ossl-sys,ossl400"
           elif [ "${{ matrix.linking }}" = "fips" ]; then
-            FEATURES="${FEATURES},fips"
+            # fips no longer implies a backend, so name one explicitly.
+            # Deliberately not ${FEATURE_SET}: standard would also pull in
+            # hotp/chacha20/ike, widening what the fips leg tests.
+            FEATURES="${FEATURES},fips,ossl-backend"
           elif [ "${{ matrix.linking }}" = "openssl-sys" ]; then
             FEATURES="${FEATURES},${FEATURE_SET},openssl-sys"
           fi
@@ -228,3 +231,73 @@ jobs:
           path: |
             /var/cache/libdnf5
           key: ${{ runner.os }}-dnf-${{ steps.get-date.outputs.date }}
+
+  build-awslc-fips:
+    name: Build (awslc-fips)
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        db: [sqlitedb, nssdb]
+        build: [debug, release]
+    container: quay.io/fedora/fedora:latest
+    steps:
+      - name: Get Date for DNF cache entry
+        id: get-date
+        run: |
+          echo "date=$(/bin/date -u "+%Y%V")" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Restore DNF cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /var/cache/libdnf5
+          key: ${{ runner.os }}-dnf-awslc-fips-${{ steps.get-date.outputs.date }}
+
+      - name: Install Dependencies
+        run: |
+          dnf -y install git cargo clang-devel golang cmake perl-interpreter \
+            zlib-devel sed sqlite-devel
+
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+
+      - name: Generate lock file
+        run: cargo generate-lockfile
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-awslc-fips-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: |
+          FEATURES="awslc-fips,${{ matrix.db }},ecc_all,ffdh,hash_all,kdf_all,rsa,mlkem"
+          OPTS="--no-default-features"
+          if [ "${{ matrix.build }}" = "release" ]; then
+            OPTS="${OPTS} --release"
+          fi
+          export KRYOPTIC_TESTS_DEFAULT_DB="${{ matrix.db }}"
+          # Build only: the awslc-fips suite still has 25 known pre-existing
+          # failures (tracked in the design spec); test coverage follows once
+          # those are resolved, matching how the plain awslc backend is treated.
+          # Scoped to -p kryoptic-lib: this container has no OpenSSL dev
+          # headers installed (it only needs AWS-LC's build deps), so a bare
+          # `cargo build` would also try to build the `ossl` workspace member
+          # and fail with "No OpenSSL version detected".
+          cargo build -vv -p kryoptic-lib $OPTS --features "$FEATURES"
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: Build logs awslc-fips-${{ matrix.db }}-${{ matrix.build }}
+          path: |
+            target/debug/build/*/output
+            target/release/build/*/output

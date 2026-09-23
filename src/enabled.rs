@@ -51,7 +51,7 @@ mod simplekdf;
 #[cfg(feature = "mlkem")]
 mod mlkem;
 
-#[cfg(feature = "mldsa")]
+#[cfg(all(feature = "mldsa", not(feature = "awslc-fips")))]
 mod mldsa;
 
 // In fips builds enable slhdsa only if ossl400 was selected, which is required
@@ -127,7 +127,7 @@ fn register_all(mechs: &mut Mechanisms, ot: &mut ObjectFactories) {
     #[cfg(feature = "mlkem")]
     mlkem::register(mechs, ot);
 
-    #[cfg(feature = "mldsa")]
+    #[cfg(all(feature = "mldsa", not(feature = "awslc-fips")))]
     mldsa::register(mechs, ot);
 
     #[cfg(all(

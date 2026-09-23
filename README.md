@@ -54,7 +54,7 @@ In order to make a different selection you need to use the cargo
 switch to disable default features (`--no-default-features`) and then
 specify the features you want to build with, eg:
 
-    $ cargo build --no-default-features --features fips,sqlitedb,nssdb
+    $ cargo build --no-default-features --features fips,ossl-backend,sqlitedb,nssdb
 
 Note that you can set `OSSL_BINDGEN_CLANG_ARGS` (whitespace delimited)
 to pass additional arguments into bindgen, in case that is important

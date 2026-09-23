@@ -1,5 +1,5 @@
 [workspace]
-members = ["ossl", "ossl-sys", "cdylib", "tools", "rustls/ossl"]
+members = ["ossl", "ossl-sys", "cdylib", "tools", "rustls/ossl", "awslc", "awslc-fips"]
 default-members = [".", "ossl", "cdylib"]
 
 [workspace.package]
@@ -73,7 +73,10 @@ simplelog = { version = "0.12.2", default-features = false, optional = true }
 toml = { version = "1.0.2", default-features = false, features = ["display", "parse", "serde"] }
 uuid = { version = "1.4.1", features = ["v4", "v8"] }
 vsprintf = { version = "2.0.0", optional = true }
-ossl.workspace = true
+ossl = { workspace = true, optional = true }
+awslc = { path = "awslc", optional = true }
+awslc-fips = { path = "awslc-fips", optional = true }
+aws-lc-fips-sys = { version = "0.14", optional = true }
 
 [features]
 aes = []
@@ -81,7 +84,7 @@ chacha20 = []
 ecc = []
 ecdsa = ["ecc"]
 ecdh = ["ecc"]
-eddsa = ["ecc", "ossl/ossl320"]
+eddsa = ["ecc", "ossl?/ossl320"]
 ec_montgomery = ["ecc"]
 ffdh = []
 hash = []
@@ -101,7 +104,7 @@ simplekdf = []
 sqlitedb = ["dep:rusqlite", "aes", "hkdf", "pbkdf2"]
 nssdb = ["dep:rusqlite", "aes", "hmac", "pbkdf2"]
 
-default = ["standard", "dynamic"]
+default = ["standard", "dynamic", "ossl-backend"]
 
 ecc_min = ["ecdsa", "ecdh"]
 ecc_all = ["ecc_min", "ec_montgomery", "eddsa"]
@@ -113,26 +116,30 @@ kdf_all = ["hkdf", "pbkdf2", "sp800_108", "sshkdf", "tlskdf", "simplekdf"]
 # bookkeeping (RFC 2409/7296's IKE-derive constructions are not themselves
 # NIST/FIPS-validated mechanisms) -- the same reasoning that keeps chacha20
 # out of hash_all/kdf_all and only in standard below.
-standard = ["sqlitedb", "ecc_all", "ffdh", "hash_all", "kdf_all", "rsa", "hotp", "chacha20", "ike"]
+standard = ["sqlitedb", "ecc_all", "ffdh", "hash_all", "kdf_all", "rsa", "hotp", "chacha20", "ike", "ossl-backend"]
 
-fips = ["ossl/fips", "sqlitedb", "rusqlite/bundled", "aes", "ecc_all", "ffdh",
+fips = ["ossl?/fips", "sqlitedb", "rusqlite/bundled", "aes", "ecc_all", "ffdh",
 "hash_all", "kdf_all", "rsa", "pqc", "dep:vsprintf"]
 
-dynamic = ["ossl/dynamic"] # Builds dynamically against system libcrypto.so
-openssl-sys = ["ossl/openssl-sys"] # Builds against system libcrypto through openssl-sys
+dynamic = ["ossl?/dynamic"] # Builds dynamically against system libcrypto.so
+openssl-sys = ["ossl?/openssl-sys"] # Builds against system libcrypto through openssl-sys
 
-log = ["dep:log", "dep:simplelog", "ossl/log"] # Enables error/info tracing
+ossl-backend = ["dep:ossl"] # Builds the default, OpenSSL-backed crypto backend
+awslc = ["dep:awslc"] # Builds the AWS-LC-backed crypto backend instead of ossl-backend
+awslc-fips = ["dep:awslc-fips", "dep:aws-lc-fips-sys", "fips"]
+
+log = ["dep:log", "dep:simplelog", "ossl?/log"] # Enables error/info tracing
 slow = [] # Enables slow tests
 
-mlkem = ["ossl/ossl350"]
-mldsa = ["hash", "ossl/ossl350"]
-slhdsa = ["hash", "ossl/ossl350"]
+mlkem = ["ossl?/ossl350"]
+mldsa = ["hash", "ossl?/ossl350"]
+slhdsa = ["hash", "ossl?/ossl350"]
 
 pqc = ["mlkem", "mldsa", "slhdsa"]
 
-minimal = ["sqlitedb", "aes", "ecc_min", "hash_all", "rsa"]
+minimal = ["sqlitedb", "aes", "ecc_min", "hash_all", "rsa", "ossl-backend"]
 
-ossl400 = ["ossl/ossl400"]
+ossl400 = ["ossl?/ossl400"]
 vsprintf = ["dep:vsprintf"]
 
 hotp = []

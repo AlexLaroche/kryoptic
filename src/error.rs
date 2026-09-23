@@ -9,6 +9,7 @@ use std::fmt;
 use crate::pkcs11::*;
 
 use asn1;
+#[cfg(feature = "ossl-backend")]
 use ossl;
 use serde_json;
 
@@ -272,6 +273,7 @@ impl From<TryFromSliceError> for Error {
     }
 }
 
+#[cfg(feature = "ossl-backend")]
 impl From<ossl::Error> for Error {
     /// Maps an openssl error
     fn from(error: ossl::Error) -> Error {
@@ -282,6 +284,25 @@ impl From<ossl::Error> for Error {
             // signature/MAC did not match — PKCS#11 v3.2 5.1 mandates
             // CKR_SIGNATURE_INVALID for this, not a device/general error.
             ossl::ErrorKind::VerifyFailed => {
+                Error::ck_rv(CKR_SIGNATURE_INVALID)
+            }
+            _ => Error::ck_rv(CKR_DEVICE_ERROR),
+        }
+    }
+}
+
+#[cfg(any(feature = "awslc", feature = "awslc-fips"))]
+impl From<crate::lowlevel::Error> for Error {
+    /// Maps an awslc backend error
+    fn from(error: crate::lowlevel::Error) -> Error {
+        match error.kind() {
+            crate::lowlevel::ErrorKind::WrapperError => {
+                Error::ck_rv(CKR_GENERAL_ERROR)
+            }
+            // The verification operation completed normally but the
+            // tag/signature did not match — PKCS#11 v3.2 5.1 mandates
+            // CKR_SIGNATURE_INVALID for this, not a device/general error.
+            crate::lowlevel::ErrorKind::VerifyFailed => {
                 Error::ck_rv(CKR_SIGNATURE_INVALID)
             }
             _ => Error::ck_rv(CKR_DEVICE_ERROR),
