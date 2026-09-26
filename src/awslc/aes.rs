@@ -301,14 +301,54 @@ impl Drop for ClassicMode {
     }
 }
 
+/// Which `CKM_AES_KEY_WRAP*` variant a [`KeyWrapCipherState`] is using.
+#[derive(Debug, Clone, Copy)]
+enum KeyWrapVariant {
+    /// `CKM_AES_KEY_WRAP`: plain (unpadded) RFC 3394 wrap.
+    Plain,
+    /// `CKM_AES_KEY_WRAP_PKCS7`: RFC 3394 wrap of PKCS7-padded input.
+    Pkcs7,
+    /// `CKM_AES_KEY_WRAP_KWP`: RFC 5649 padded wrap.
+    Kwp,
+}
+
+/// State for a classic (non-message) `Encryption`/`Decryption` operation
+/// using `CKM_AES_KEY_WRAP`/`_PKCS7`/`_KWP` as a generic cipher on
+/// arbitrary data, matching the reference backend's own treatment of
+/// these mechanisms as "just another `EncAlg`" (`src/ossl/aes.rs`'s
+/// `EncAlg::AesWrap`/`AesWrapPad`). This is distinct from `wrap`/`unwrap`,
+/// which use these same mechanisms to wrap/unwrap a key OBJECT instead
+/// and never construct an `AesOperation` at all.
+#[derive(Debug)]
+struct KeyWrapCipherState {
+    kw: AesKeyWrap,
+    variant: KeyWrapVariant,
+    /// Custom 8-byte IV from `mech.pParameter`, for `Plain`/`Pkcs7`
+    /// (`None` uses RFC 3394's default).
+    iv: Option<[u8; 8]>,
+    /// Custom 4-byte AIV prefix from `mech.pParameter`, for `Kwp` (`None`
+    /// uses RFC 5649's default constant).
+    prefix: Option<[u8; 4]>,
+    /// Accumulates every `encrypt_update`/`decrypt_update` call's input:
+    /// `AesKeyWrap` has no real incremental operation, so nothing is
+    /// wrapped/unwrapped until `encrypt_final`/`decrypt_final` runs it over
+    /// everything buffered here (mirroring how `ClassicMode::Ccm`/`Gcm`
+    /// also buffer a whole message before their own one-shot primitive
+    /// call).
+    buffer: Vec<u8>,
+}
+
 /// An active AES operation: either the one-shot `CKM_AES_GCM`
-/// message-mode path (`msg_encrypt_init`/`msg_decrypt_init`), or a
-/// classic (non-message) `Encryption`/`Decryption` operation
-/// (`encrypt_new`/`decrypt_new`) covering ECB, CBC, CBC-PAD, CTR, OFB,
-/// CFB1/8/128, GCM and CCM. `wrap`/`unwrap` (AES key-wrap:
-/// `CKM_AES_KEY_WRAP`/`_PKCS7`/`_KWP`) are separate one-shot associated
-/// functions built on `awslc::cipher::AesKeyWrap`, not part of this
-/// struct's own state machine (see `wrap`'s doc comment for why).
+/// message-mode path (`msg_encrypt_init`/`msg_decrypt_init`), a classic
+/// (non-message) `Encryption`/`Decryption` operation (`encrypt_new`/
+/// `decrypt_new`) covering ECB, CBC, CBC-PAD, CTR, OFB, CFB1/8/128, GCM
+/// and CCM (`classic`), or that same classic `Encryption`/`Decryption`
+/// API used with `CKM_AES_KEY_WRAP`/`_PKCS7`/`_KWP` on arbitrary data
+/// (`key_wrap`, see [`KeyWrapCipherState`]). `wrap`/`unwrap` (AES
+/// key-wrap of a key OBJECT via `C_WrapKey`/`C_UnwrapKey`) are separate
+/// one-shot associated functions built directly on
+/// `awslc::cipher::AesKeyWrap`, not part of this struct's own state
+/// machine at all (see `wrap`'s doc comment for why).
 #[derive(Debug)]
 pub struct AesOperation {
     mech: CK_MECHANISM_TYPE,
@@ -336,6 +376,17 @@ pub struct AesOperation {
     /// `CKG_GENERATE_COUNTER`/`CKG_GENERATE_COUNTER_XOR`, non-zero
     /// `ulIvFixedBits`) applies to both `awslc` and `awslc-fips` builds.
     msg_iv: Option<AesIvData>,
+    /// `Some` only for a classic (non-message) `Encryption`/`Decryption`
+    /// operation using `CKM_AES_KEY_WRAP`/`_PKCS7`/`_KWP` as a generic
+    /// cipher on arbitrary data (distinct from `wrap`/`unwrap`'s own use
+    /// of these same mechanisms to wrap/unwrap a key OBJECT, which never
+    /// constructs an `AesOperation` at all). Kept out of `ClassicMode`
+    /// since `AesKeyWrap` isn't a `BlockCipher`/AEAD shape (see `wrap`'s
+    /// doc comment), and this one-shot construct has no real incremental
+    /// update, so a small separate field is simpler than threading a new
+    /// variant through every existing `ClassicMode` match arm. Mutually
+    /// exclusive with `classic`: exactly one of the two is `Some`.
+    key_wrap: Option<KeyWrapCipherState>,
     /// FIPS approval status for the operation.
     #[cfg(feature = "fips")]
     fips_approval: FipsApproval,
@@ -400,12 +451,20 @@ impl AesOperation {
 
     /// Shared `encrypt_new`/`decrypt_new` implementation: validates the
     /// key, parses the mechanism's parameters and builds the appropriate
-    /// `ClassicMode` for it.
+    /// `ClassicMode` for it. `CKM_AES_KEY_WRAP*` mechanisms are diverted
+    /// to [`Self::key_wrap_classic_new`] instead, since they build a
+    /// `KeyWrapCipherState`, not a `ClassicMode`.
     fn classic_new(
         mech: &CK_MECHANISM,
         key: &Object,
         encrypting: bool,
     ) -> Result<AesOperation> {
+        if matches!(
+            mech.mechanism,
+            CKM_AES_KEY_WRAP | CKM_AES_KEY_WRAP_PKCS7 | CKM_AES_KEY_WRAP_KWP
+        ) {
+            return Self::key_wrap_classic_new(mech, key, encrypting);
+        }
         // `keybytes` holds the raw AES key from here on: every early
         // return between acquiring it and handing it off to the
         // successfully-constructed `AesOperation` (which takes over
@@ -452,6 +511,7 @@ impl AesOperation {
             encrypting,
             in_use: false,
             msg_iv: None,
+            key_wrap: None,
             #[cfg(feature = "fips")]
             fips_approval,
         };
@@ -486,6 +546,173 @@ impl AesOperation {
         }
 
         Ok(op)
+    }
+
+    /// Builds an `AesOperation` whose `key_wrap` (not `classic`) field is
+    /// populated, for `CKM_AES_KEY_WRAP`/`_PKCS7`/`_KWP` used as a generic
+    /// cipher via `encrypt_new`/`decrypt_new`. Parses the same optional
+    /// custom IV/AIV-prefix `mech.pParameter` that `wrap`/`unwrap` accept
+    /// (see `parse_kw_iv`/`parse_kwp_prefix`). `key` is empty: the raw
+    /// bytes aren't needed once `AesKeyWrap::new` has built its own key
+    /// schedule from them (`key_wrap_cipher` already scrubs its own
+    /// temporary copy), unlike classic mode's `ClassicMode`, which needs
+    /// `self.key` again on every `encrypt_update`/`decrypt_update` call.
+    fn key_wrap_classic_new(
+        mech: &CK_MECHANISM,
+        key: &Object,
+        encrypting: bool,
+    ) -> Result<AesOperation> {
+        let kw = Self::key_wrap_cipher(key)?;
+        let (variant, iv, prefix) = match mech.mechanism {
+            CKM_AES_KEY_WRAP => (
+                KeyWrapVariant::Plain,
+                Self::parse_kw_iv(mech, CKR_ARGUMENTS_BAD)?,
+                None,
+            ),
+            CKM_AES_KEY_WRAP_PKCS7 => (
+                KeyWrapVariant::Pkcs7,
+                Self::parse_kw_iv(mech, CKR_ARGUMENTS_BAD)?,
+                None,
+            ),
+            CKM_AES_KEY_WRAP_KWP => (
+                KeyWrapVariant::Kwp,
+                None,
+                Self::parse_kwp_prefix(mech, CKR_ARGUMENTS_BAD)?,
+            ),
+            _ => unreachable!(),
+        };
+        Ok(AesOperation {
+            mech: mech.mechanism,
+            key: Vec::new(),
+            finalized: false,
+            classic: None,
+            encrypting,
+            in_use: false,
+            msg_iv: None,
+            key_wrap: Some(KeyWrapCipherState {
+                kw,
+                variant,
+                iv,
+                prefix,
+                buffer: Vec::new(),
+            }),
+            #[cfg(feature = "fips")]
+            fips_approval: FipsApproval::init(),
+        })
+    }
+
+    /// `Encryption::encrypt_final` for a `key_wrap` operation: wraps
+    /// everything `encrypt_update` has buffered so far (AES-KW has no real
+    /// incremental output, so every `encrypt_update` call only buffers --
+    /// see `key_wrap_encrypt_update`). Brackets the real `AesKeyWrap` call
+    /// with `fips_approval.clear()`/`update()`, the same convention
+    /// `classic_encrypt_update`/`_final` use for every other mode --
+    /// AWS-LC's `AES_wrap_key`/`_padded` genuinely call
+    /// `FIPS_service_indicator_update_state()` internally (confirmed
+    /// against `crypto/fipsmodule/aes/key_wrap.c`), so this observes a
+    /// real indicator, not a guess. A `CKR_BUFFER_TOO_SMALL` result is
+    /// non-fatal per the `Encryption`/`Decryption` trait contract: the
+    /// buffered plaintext and `finalized` are left untouched so the caller
+    /// can retry with a bigger buffer.
+    fn key_wrap_finalize_encrypt(
+        &mut self,
+        cipher: &mut [u8],
+    ) -> Result<usize> {
+        let variant = self.key_wrap.as_ref().unwrap().variant;
+        let iv = self.key_wrap.as_ref().unwrap().iv;
+        let prefix = self.key_wrap.as_ref().unwrap().prefix;
+        let result = {
+            let state = self.key_wrap.as_ref().unwrap();
+            let kw = &state.kw;
+            #[cfg(feature = "fips")]
+            self.fips_approval.clear();
+            let r = match variant {
+                KeyWrapVariant::Plain => {
+                    Self::wrap_plain(kw, &state.buffer, iv.as_ref(), cipher)
+                }
+                KeyWrapVariant::Pkcs7 => {
+                    let mut data = state.buffer.clone();
+                    let r =
+                        Self::wrap_pkcs7(kw, &mut data, iv.as_ref(), cipher);
+                    zeromem(&mut data);
+                    r
+                }
+                KeyWrapVariant::Kwp => {
+                    Self::wrap_kwp(kw, &state.buffer, prefix, cipher)
+                }
+            };
+            #[cfg(feature = "fips")]
+            self.fips_approval.update();
+            r
+        };
+        match &result {
+            Err(e) if e.rv() == CKR_BUFFER_TOO_SMALL => (),
+            _ => {
+                self.finalized = true;
+                zeromem(&mut self.key_wrap.as_mut().unwrap().buffer);
+            }
+        }
+        result.map_err(|e| {
+            if e.rv() == CKR_BUFFER_TOO_SMALL {
+                e
+            } else {
+                self.op_err(e.rv())
+            }
+        })
+    }
+
+    /// `Decryption::decrypt_final` for a `key_wrap` operation. See
+    /// `key_wrap_finalize_encrypt`'s doc comment for the FIPS-approval
+    /// rationale. Unlike the wrap side, `AesKeyWrap`'s unwrap has no
+    /// buffer-size-query mode -- the real unwrapped length is only known
+    /// after actually unwrapping -- so a too-small caller buffer is
+    /// detected only after the fact; when that happens, the buffered
+    /// ciphertext and `finalized` are left untouched (matching the
+    /// `CKR_BUFFER_TOO_SMALL` contract) so a retry with a bigger buffer
+    /// redoes the unwrap instead of operating on already-scrubbed state.
+    fn key_wrap_finalize_decrypt(&mut self, plain: &mut [u8]) -> Result<usize> {
+        let variant = self.key_wrap.as_ref().unwrap().variant;
+        let iv = self.key_wrap.as_ref().unwrap().iv;
+        let prefix = self.key_wrap.as_ref().unwrap().prefix;
+        let result: std::result::Result<Vec<u8>, Error> = {
+            let state = self.key_wrap.as_ref().unwrap();
+            let kw = &state.kw;
+            #[cfg(feature = "fips")]
+            self.fips_approval.clear();
+            let r = match variant {
+                KeyWrapVariant::Plain => {
+                    Self::unwrap_plain(kw, &state.buffer, iv.as_ref())
+                }
+                KeyWrapVariant::Pkcs7 => {
+                    Self::unwrap_pkcs7(kw, &state.buffer, iv.as_ref())
+                }
+                KeyWrapVariant::Kwp => {
+                    Self::unwrap_kwp(kw, &state.buffer, prefix)
+                }
+            };
+            #[cfg(feature = "fips")]
+            self.fips_approval.update();
+            r
+        };
+        let mut out = match result {
+            Ok(o) => o,
+            Err(e) => {
+                self.finalized = true;
+                zeromem(&mut self.key_wrap.as_mut().unwrap().buffer);
+                return Err(self.op_err(e.rv()));
+            }
+        };
+        if plain.len() < out.len() {
+            let needed = out.len();
+            zeromem(&mut out);
+            return Err(Error::buf_too_small(needed));
+        }
+        self.finalized = true;
+        zeromem(&mut self.key_wrap.as_mut().unwrap().buffer);
+        plain[..out.len()].copy_from_slice(&out);
+        let n = out.len();
+        zeromem(&mut out);
+        Ok(n)
     }
 
     /// Parses `mech`'s parameters and builds the `ClassicMode` for it,
@@ -1178,8 +1405,18 @@ impl AesOperation {
 
     /// Parses `mech.pParameter` as `CKM_AES_KEY_WRAP`/`_PKCS7`'s optional
     /// 8-byte custom IV: absent (`ulParameterLen == 0`) means "use RFC
-    /// 3394's default", any other length is invalid.
-    fn parse_kw_iv(mech: &CK_MECHANISM) -> Result<Option<[u8; 8]>> {
+    /// 3394's default", any other length is invalid -- reported as
+    /// `bad_len_err`, since PKCS#11 wants different codes for the same
+    /// malformed parameter depending on the API it came through:
+    /// `CKR_MECHANISM_PARAM_INVALID` for `C_WrapKey`/`C_UnwrapKey` (`wrap`/
+    /// `unwrap`'s own callers), `CKR_ARGUMENTS_BAD` for `C_EncryptInit`/
+    /// `C_DecryptInit` (`key_wrap_classic_new`'s caller), matching how this
+    /// same file's classic CBC/CBC-PAD IV-length check already uses
+    /// `CKR_ARGUMENTS_BAD`.
+    fn parse_kw_iv(
+        mech: &CK_MECHANISM,
+        bad_len_err: CK_RV,
+    ) -> Result<Option<[u8; 8]>> {
         match mech.ulParameterLen {
             0 => Ok(None),
             8 => {
@@ -1187,14 +1424,18 @@ impl AesOperation {
                 iv.copy_from_slice(&bytes_to_vec(mech.pParameter, 8));
                 Ok(Some(iv))
             }
-            _ => Err(CKR_MECHANISM_PARAM_INVALID)?,
+            _ => Err(bad_len_err)?,
         }
     }
 
     /// Parses `mech.pParameter` as `CKM_AES_KEY_WRAP_KWP`'s optional 4-byte
     /// custom AIV prefix: absent (`ulParameterLen == 0`) means "use RFC
-    /// 5649's default constant", any other length is invalid.
-    fn parse_kwp_prefix(mech: &CK_MECHANISM) -> Result<Option<[u8; 4]>> {
+    /// 5649's default constant", any other length is invalid. See
+    /// `parse_kw_iv`'s doc comment for why the error code is a parameter.
+    fn parse_kwp_prefix(
+        mech: &CK_MECHANISM,
+        bad_len_err: CK_RV,
+    ) -> Result<Option<[u8; 4]>> {
         match mech.ulParameterLen {
             0 => Ok(None),
             4 => {
@@ -1202,7 +1443,7 @@ impl AesOperation {
                 prefix.copy_from_slice(&bytes_to_vec(mech.pParameter, 4));
                 Ok(Some(prefix))
             }
-            _ => Err(CKR_MECHANISM_PARAM_INVALID)?,
+            _ => Err(bad_len_err)?,
         }
     }
 
@@ -1291,6 +1532,65 @@ impl AesOperation {
         Ok(n)
     }
 
+    /// Wraps `keydata` through a generic cipher mechanism (every mechanism
+    /// `crate::aes::AES_MECHS` grants `CKF_WRAP` to besides the dedicated
+    /// `CKM_AES_KEY_WRAP*` family: ECB/CBC/CBC-PAD/CTR/CTS and GCM/CCM),
+    /// mirroring `crate::ossl::aes::AesOperation::wrap`'s own handling of
+    /// these mechanisms via the exact same `encrypt_new`/`encrypt`/
+    /// `encryption_len` this backend already implements for `C_Encrypt`.
+    fn wrap_cipher(
+        mech: &CK_MECHANISM,
+        wrapping_key: &Object,
+        keydata: &mut Vec<u8>,
+        output: &mut [u8],
+    ) -> Result<usize> {
+        let mut op = Self::encrypt_new(mech, wrapping_key)?;
+        match mech.mechanism {
+            CKM_AES_CBC | CKM_AES_ECB => {
+                /* Non-padding block modes need zero padding for the input. */
+                let pad = keydata.len() % AES_BLOCK_SIZE;
+                if pad != 0 {
+                    keydata.resize(keydata.len() + AES_BLOCK_SIZE - pad, 0);
+                }
+            }
+            CKM_AES_CCM => {
+                /* AWS-LC's one-shot AesCcm has no way to report a
+                 * data-length mismatch itself before the real `seal` call,
+                 * so check it here, matching the reference. */
+                let datalen = match &op.classic {
+                    Some(ClassicMode::Ccm { datalen, .. }) => *datalen,
+                    _ => unreachable!(),
+                };
+                if datalen != keydata.len() {
+                    return Err(CKR_MECHANISM_PARAM_INVALID)?;
+                }
+            }
+            _ => (),
+        }
+        let needed_len = op.encryption_len(keydata.len(), true)?;
+        if output.len() == 0 {
+            return Ok(needed_len);
+        }
+        if output.len() < needed_len {
+            return Err(Error::buf_too_small(needed_len));
+        }
+        op.encrypt(keydata, output)
+    }
+
+    /// Unwraps `data` through a generic cipher mechanism. See
+    /// `wrap_cipher`'s doc comment.
+    fn unwrap_cipher(
+        mech: &CK_MECHANISM,
+        wrapping_key: &Object,
+        data: &[u8],
+    ) -> Result<Vec<u8>> {
+        let mut op = Self::decrypt_new(mech, wrapping_key)?;
+        let mut result = vec![0u8; data.len()];
+        let outlen = op.decrypt(data, result.as_mut_slice())?;
+        result.resize(outlen, 0);
+        Ok(result)
+    }
+
     /// Instantiates a new AES Key-Wrap operation and performs the wrap in
     /// one shot, mirroring `crate::ossl::aes::AesOperation::wrap`'s
     /// signature and its buffer-size-query contract (`output.len() == 0`
@@ -1330,37 +1630,47 @@ impl AesOperation {
             }
         };
         let result = match mech.mechanism {
-            CKM_AES_KEY_WRAP => match Self::parse_kw_iv(mech) {
-                Ok(iv) => Self::wrap_plain(&kw, &keydata, iv.as_ref(), output),
-                Err(e) => Err(e),
-            },
-            CKM_AES_KEY_WRAP_PKCS7 => match Self::parse_kw_iv(mech) {
-                Ok(iv) => {
-                    Self::wrap_pkcs7(&kw, &mut keydata, iv.as_ref(), output)
+            CKM_AES_KEY_WRAP => {
+                match Self::parse_kw_iv(mech, CKR_MECHANISM_PARAM_INVALID) {
+                    Ok(iv) => {
+                        Self::wrap_plain(&kw, &keydata, iv.as_ref(), output)
+                    }
+                    Err(e) => Err(e),
                 }
-                Err(e) => Err(e),
-            },
-            CKM_AES_KEY_WRAP_KWP => match Self::parse_kwp_prefix(mech) {
-                Ok(prefix) => Self::wrap_kwp(&kw, &keydata, prefix, output),
-                Err(e) => Err(e),
-            },
+            }
+            CKM_AES_KEY_WRAP_PKCS7 => {
+                match Self::parse_kw_iv(mech, CKR_MECHANISM_PARAM_INVALID) {
+                    Ok(iv) => {
+                        Self::wrap_pkcs7(&kw, &mut keydata, iv.as_ref(), output)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            CKM_AES_KEY_WRAP_KWP => {
+                match Self::parse_kwp_prefix(mech, CKR_MECHANISM_PARAM_INVALID)
+                {
+                    Ok(prefix) => Self::wrap_kwp(&kw, &keydata, prefix, output),
+                    Err(e) => Err(e),
+                }
+            }
             // Every mechanism the shared `crate::aes::AES_MECHS` table
             // grants CKF_WRAP to besides the CKM_AES_KEY_WRAP* family
             // lands here (ECB/CBC/CBC-PAD/CTR/CTS and GCM/CCM: see
             // `AES_MECHS[0]`/`[1]` in `src/aes.rs`, which this module's
-            // `register_mechanisms` reuses for both backends). The
-            // reference `crate::ossl::aes::AesOperation::wrap` genuinely
-            // supports wrapping key material through those cipher
-            // mechanisms (zero-padding to a block boundary for CBC/ECB, a
-            // datalen-match check for CCM); this backend deliberately does
-            // not implement that -- it is real, independently-risky work
-            // better done as its own reviewed task -- so it rejects them
-            // here explicitly, the same deliberate, tested gap as
-            // `CKM_AES_CTS` above (`encrypt_new`/`decrypt_new` reject it
-            // for the same reason: AWS-LC has no equivalent primitive
-            // wired up yet). Only the dedicated CKM_AES_KEY_WRAP*
-            // mechanisms above actually wrap.
-            _ => Err(CKR_MECHANISM_INVALID)?,
+            // `register_mechanisms` reuses for both backends), matching
+            // the reference `crate::ossl::aes::AesOperation::wrap`, which
+            // treats these mechanisms identically whether reached through
+            // `C_WrapKey` or `C_Encrypt`: `encrypt_new` already implements
+            // every one of them (rejecting `CKM_AES_CTS` itself, same as
+            // the reference), so this just reuses that machinery --
+            // zero-padding to a block boundary for the two non-padding
+            // block modes first, since `encrypt`/`encryption_len` require
+            // exact block-multiple input for those (`ClassicMode::Block`'s
+            // `padded: false` arm), and checking CCM's configured data
+            // length against `keydata` up front, since AWS-LC's one-shot
+            // `AesCcm` has no way to report that mismatch itself before
+            // the real `seal` call.
+            _ => Self::wrap_cipher(mech, wrapping_key, &mut keydata, output),
         };
         zeromem(&mut keydata);
         result
@@ -1488,22 +1798,25 @@ impl AesOperation {
     ) -> Result<Vec<u8>> {
         let kw = Self::key_wrap_cipher(wrapping_key)?;
         match mech.mechanism {
-            CKM_AES_KEY_WRAP => {
-                Self::unwrap_plain(&kw, data, Self::parse_kw_iv(mech)?.as_ref())
-            }
-            CKM_AES_KEY_WRAP_PKCS7 => {
-                Self::unwrap_pkcs7(&kw, data, Self::parse_kw_iv(mech)?.as_ref())
-            }
-            CKM_AES_KEY_WRAP_KWP => {
-                Self::unwrap_kwp(&kw, data, Self::parse_kwp_prefix(mech)?)
-            }
+            CKM_AES_KEY_WRAP => Self::unwrap_plain(
+                &kw,
+                data,
+                Self::parse_kw_iv(mech, CKR_MECHANISM_PARAM_INVALID)?.as_ref(),
+            ),
+            CKM_AES_KEY_WRAP_PKCS7 => Self::unwrap_pkcs7(
+                &kw,
+                data,
+                Self::parse_kw_iv(mech, CKR_MECHANISM_PARAM_INVALID)?.as_ref(),
+            ),
+            CKM_AES_KEY_WRAP_KWP => Self::unwrap_kwp(
+                &kw,
+                data,
+                Self::parse_kwp_prefix(mech, CKR_MECHANISM_PARAM_INVALID)?,
+            ),
             // Mirrors `wrap`'s own fallback arm above: CBC/ECB/CTR/CTS and
             // GCM/CCM also carry CKF_UNWRAP in the shared mechanism-info
-            // table, but this backend deliberately does not support
-            // unwrapping through cipher mechanisms, only through the
-            // dedicated CKM_AES_KEY_WRAP* family -- see `wrap`'s comment
-            // for the rationale.
-            _ => Err(CKR_MECHANISM_INVALID)?,
+            // table -- see `wrap_cipher`'s doc comment.
+            _ => Self::unwrap_cipher(mech, wrapping_key, data),
         }
     }
 
@@ -1553,6 +1866,7 @@ impl AesOperation {
             // likewise seeds `params.iv` from a dummy, parameter-less
             // `CK_MECHANISM` at this same point.
             msg_iv: None,
+            key_wrap: None,
             #[cfg(feature = "fips")]
             fips_approval: FipsApproval::init(),
         })
@@ -1582,6 +1896,7 @@ impl AesOperation {
             in_use: false,
             // See msg_encrypt_init's doc comment for why this starts `None`.
             msg_iv: None,
+            key_wrap: None,
             #[cfg(feature = "fips")]
             fips_approval: FipsApproval::init(),
         })
@@ -2208,7 +2523,13 @@ impl MsgDecryption for AesOperation {
 
 impl Encryption for AesOperation {
     /// One-shot encryption: `encrypt_update` followed by `encrypt_final`,
-    /// mirroring `crate::ossl::aes::AesOperation::encrypt`.
+    /// mirroring `crate::ossl::aes::AesOperation::encrypt`. For `key_wrap`
+    /// operations this composition still works unmodified: `encrypt_update`
+    /// just buffers (AES-KW has no real incremental output), and
+    /// `encrypt_final` does the whole wrap over everything buffered so
+    /// far, exactly the multi-part streaming case the reference also
+    /// supports for these mechanisms -- the same buffer-then-wrap-at-final
+    /// path serves both.
     fn encrypt(&mut self, plain: &[u8], cipher: &mut [u8]) -> Result<usize> {
         if self.finalized {
             return Err(CKR_OPERATION_NOT_INITIALIZED)?;
@@ -2238,6 +2559,10 @@ impl Encryption for AesOperation {
             /* This is the only, non-fatal error */
             return Err(Error::buf_too_small(outlen));
         }
+        if let Some(state) = self.key_wrap.as_mut() {
+            state.buffer.extend_from_slice(plain);
+            return Ok(0);
+        }
         if self.classic.is_none() {
             return Err(self.op_err(CKR_GENERAL_ERROR));
         }
@@ -2264,6 +2589,9 @@ impl Encryption for AesOperation {
         }
         if !self.in_use {
             return Err(CKR_OPERATION_NOT_INITIALIZED)?;
+        }
+        if self.key_wrap.is_some() {
+            return self.key_wrap_finalize_encrypt(cipher);
         }
         // Buffer-too-small pre-check: must happen before finalizing, and
         // mirrors the exact required sizes `crate::ossl::aes` checks for
@@ -2313,6 +2641,50 @@ impl Encryption for AesOperation {
     fn encryption_len(&mut self, data_len: usize, fin: bool) -> Result<usize> {
         if self.finalized {
             return Err(CKR_OPERATION_NOT_INITIALIZED)?;
+        }
+        if let Some(state) = &self.key_wrap {
+            // key_wrap operations only ever emit output from
+            // encrypt_final, once everything is buffered: an `encrypt_
+            // update` query (`fin: false`) always predicts 0, and a
+            // `encrypt_final` query (`fin: true`) predicts the wrap of
+            // everything buffered so far plus this call's own `data_len`
+            // (matching `encrypt_update`'s own pre-check, which queries
+            // with `fin: false` before buffering `plain`). Uses the same
+            // query mode (`output.len() == 0`) `wrap`'s own callers use,
+            // so no real `AesKeyWrap` call happens here.
+            if !fin {
+                return Ok(0);
+            }
+            let total_len = state.buffer.len() + data_len;
+            let outcome = match state.variant {
+                KeyWrapVariant::Plain => Self::wrap_plain(
+                    &state.kw,
+                    &vec![0u8; total_len],
+                    None,
+                    &mut [],
+                ),
+                KeyWrapVariant::Pkcs7 => Self::wrap_pkcs7(
+                    &state.kw,
+                    &mut vec![0u8; total_len],
+                    None,
+                    &mut [],
+                ),
+                KeyWrapVariant::Kwp => Self::wrap_kwp(
+                    &state.kw,
+                    &vec![0u8; total_len],
+                    None,
+                    &mut [],
+                ),
+            };
+            // Matches the classic-mode arm below: any error from a length
+            // query (this is never a buffer-size query itself -- `output`
+            // is always empty here -- so `Error::buf_too_small` is not a
+            // possible outcome) finalizes the operation, same as a real
+            // encrypt failure would.
+            return match outcome {
+                Ok(n) => Ok(n),
+                Err(e) => Err(self.op_err(e.rv())),
+            };
         }
         let classic = match &self.classic {
             Some(c) => c,
@@ -2390,7 +2762,9 @@ impl Encryption for AesOperation {
 
 impl Decryption for AesOperation {
     /// One-shot decryption: `decrypt_update` followed by `decrypt_final`,
-    /// mirroring `crate::ossl::aes::AesOperation::decrypt`.
+    /// mirroring `crate::ossl::aes::AesOperation::decrypt`. See
+    /// `Encryption::encrypt`'s doc comment for why this composition also
+    /// serves `key_wrap` operations unmodified.
     fn decrypt(&mut self, cipher: &[u8], plain: &mut [u8]) -> Result<usize> {
         if self.finalized {
             return Err(CKR_OPERATION_NOT_INITIALIZED)?;
@@ -2420,6 +2794,10 @@ impl Decryption for AesOperation {
             /* This is the only, non-fatal error */
             return Err(Error::buf_too_small(outlen));
         }
+        if let Some(state) = self.key_wrap.as_mut() {
+            state.buffer.extend_from_slice(cipher);
+            return Ok(0);
+        }
         if self.classic.is_none() {
             return Err(self.op_err(CKR_GENERAL_ERROR));
         }
@@ -2446,6 +2824,9 @@ impl Decryption for AesOperation {
         }
         if !self.in_use {
             return Err(CKR_OPERATION_NOT_INITIALIZED)?;
+        }
+        if self.key_wrap.is_some() {
+            return self.key_wrap_finalize_decrypt(plain);
         }
         // Buffer-too-small pre-check, symmetric with `encrypt_final`'s
         // (see that method's comment): without this, an undersized
@@ -2492,6 +2873,25 @@ impl Decryption for AesOperation {
     fn decryption_len(&mut self, data_len: usize, fin: bool) -> Result<usize> {
         if self.finalized {
             return Err(CKR_OPERATION_NOT_INITIALIZED)?;
+        }
+        if let Some(state) = &self.key_wrap {
+            // Only decrypt_final ever emits output (see encryption_len's
+            // key_wrap comment for the symmetric encrypt-side rationale);
+            // a decrypt_update query (`fin: false`) always predicts 0.
+            if !fin {
+                return Ok(0);
+            }
+            // A safe upper bound over everything buffered so far plus this
+            // call's own data_len, same convention `ClassicMode::Block`'s
+            // own padded arm above uses: PKCS7/KWP may return less once
+            // really unwrapped (their real length isn't knowable without
+            // doing that), but plain RFC 3394 unwrap's length is always
+            // exactly this for all three variants -- the 8-byte integrity/
+            // IV overhead is the only thing ever subtracted.
+            return match (state.buffer.len() + data_len).checked_sub(8) {
+                Some(n) => Ok(n),
+                None => Err(self.op_err(CKR_ENCRYPTED_DATA_LEN_RANGE)),
+            };
         }
         let classic = match &self.classic {
             Some(c) => c,
@@ -4478,34 +4878,55 @@ mod tests {
         assert_eq!(err.rv(), CKR_MECHANISM_INVALID);
     }
 
-    /// `CKM_AES_CBC` (and every other classic cipher mechanism) is
+    /// `CKM_AES_ECB` (and every other classic cipher mechanism) is
     /// advertised with `CKF_WRAP`/`CKF_UNWRAP` via the shared
-    /// `crate::aes::AES_MECHS` table, but this backend only implements
-    /// wrap/unwrap through the dedicated `CKM_AES_KEY_WRAP*` family --
-    /// see `AesOperation::wrap`'s doc comment. Pins this as a deliberate,
-    /// tested gap, mirroring `cts_is_not_supported` above (the reference
-    /// `crate::ossl::aes` backend genuinely supports this; implementing
-    /// it here is real, independently-risky work deferred to its own
-    /// task).
+    /// `crate::aes::AES_MECHS` table, and `wrap`/`unwrap` support it via
+    /// `wrap_cipher`/`unwrap_cipher`, matching the reference
+    /// `crate::ossl::aes::AesOperation::wrap`. A single AES block needs no
+    /// zero-padding, so this also confirms wrap/unwrap round-trip through
+    /// `AesOperation::encrypt_new`/`decrypt_new` directly (not just via
+    /// PKCS#11's own `C_Encrypt`/`C_Decrypt`, exercised by
+    /// `src/tests/keys.rs`'s `test_rsa_key`/`test_rsa_key_unwrap_vector`).
     #[test]
-    fn cipher_mechanism_wrap_is_not_supported() {
+    fn cipher_mechanism_wrap_round_trip() {
         let kek = test_key(&[0x11u8; 32]);
-        // `ecb_mech()` (unlike `cbc_like_mech`) has `ulParameterLen == 0`,
-        // so this actually reaches `wrap`/`unwrap`'s mechanism-match
-        // fallback arm rather than tripping their earlier
-        // "no custom IV/parameter supported" guard (which would otherwise
-        // return CKR_MECHANISM_PARAM_INVALID here instead, for the wrong
-        // reason).
         let mech = ecb_mech();
-        let keydata = vec![0u8; AES_BLOCK_SIZE];
+        let keydata = vec![0x42u8; AES_BLOCK_SIZE];
         let mut output = vec![0u8; AES_BLOCK_SIZE * 2];
 
-        let err = AesOperation::wrap(&mech, &kek, keydata.clone(), &mut output)
-            .unwrap_err();
-        assert_eq!(err.rv(), CKR_MECHANISM_INVALID);
+        let n = AesOperation::wrap(&mech, &kek, keydata.clone(), &mut output)
+            .unwrap();
+        assert_eq!(n, AES_BLOCK_SIZE);
+        assert_ne!(&output[..n], keydata.as_slice());
 
-        let err = AesOperation::unwrap(&mech, &kek, &keydata).unwrap_err();
-        assert_eq!(err.rv(), CKR_MECHANISM_INVALID);
+        let unwrapped =
+            AesOperation::unwrap(&mech, &kek, &output[..n]).unwrap();
+        assert_eq!(unwrapped, keydata);
+    }
+
+    /// `CKM_AES_CBC`/`_ECB` require block-aligned input for the classic
+    /// (non-padded) `Encrypt`/`Decrypt` path -- `wrap_cipher` must zero-pad
+    /// `keydata` up to a block boundary first, matching the reference.
+    #[test]
+    fn cipher_mechanism_wrap_pads_to_block_boundary() {
+        let kek = test_key(&[0x22u8; 32]);
+        let mech = ecb_mech();
+        let keydata = vec![0x7Fu8; AES_BLOCK_SIZE + 3];
+        let mut output = vec![0u8; AES_BLOCK_SIZE * 2];
+
+        let n = AesOperation::wrap(&mech, &kek, keydata.clone(), &mut output)
+            .unwrap();
+        assert_eq!(n, AES_BLOCK_SIZE * 2);
+
+        // Unwrap recovers the zero-padded (not the original) length --
+        // CKM_AES_ECB/_CBC are not padding-aware, so the caller is
+        // responsible for knowing/trimming the real length, same as the
+        // reference backend.
+        let unwrapped =
+            AesOperation::unwrap(&mech, &kek, &output[..n]).unwrap();
+        assert_eq!(unwrapped.len(), AES_BLOCK_SIZE * 2);
+        assert_eq!(&unwrapped[..keydata.len()], keydata.as_slice());
+        assert!(unwrapped[keydata.len()..].iter().all(|&b| b == 0));
     }
 
     #[test]
