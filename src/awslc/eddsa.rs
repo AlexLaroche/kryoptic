@@ -780,18 +780,21 @@ mod tests {
         assert_eq!(err.rv(), CKR_CURVE_NOT_SUPPORTED);
     }
 
-    /// `CK_EDDSA_PARAMS` requesting the prehashed variant (Ed25519ph) must
-    /// be rejected -- there's no AWS-LC primitive for it (see the module
-    /// doc comment).
+    /// `CK_EDDSA_PARAMS` requesting the prehashed variant (Ed25519ph) is
+    /// supported via `ED25519ph_sign`/`_verify` (see `check_params`'s doc
+    /// comment); the reference distinguishes it via `phFlag` alone,
+    /// context length is independent (may be empty or not).
     #[test]
-    fn ed25519ph_is_rejected() {
+    #[cfg(not(feature = "fips"))]
+    fn ed25519ph_sign_verify_round_trip() {
         let (mechs, _ot) = registered();
-        let (_pubkey, privkey) =
+        let (pubkey, privkey) =
             generate_keypair(&mechs, crate::ec::EDWARDS25519);
+        let context = b"some context".to_vec();
         let params = CK_EDDSA_PARAMS {
             phFlag: CK_TRUE,
-            ulContextDataLen: 0,
-            pContextData: std::ptr::null_mut(),
+            ulContextDataLen: context.len() as CK_ULONG,
+            pContextData: context.as_ptr() as *mut u8,
         };
         let mech = CK_MECHANISM {
             mechanism: CKM_EDDSA,
@@ -799,19 +802,30 @@ mod tests {
             ulParameterLen: std::mem::size_of::<CK_EDDSA_PARAMS>() as CK_ULONG,
         };
         let entry = mechs.get(CKM_EDDSA).unwrap();
-        let err = entry
-            .sign_new(&mech, &privkey)
-            .expect_err("Ed25519ph must be rejected: no AWS-LC primitive");
-        assert_eq!(err.rv(), CKR_MECHANISM_PARAM_INVALID);
+        let data = b"ed25519ph test message";
+
+        let mut sign_op = entry.sign_new(&mech, &privkey).expect("sign_new");
+        let mut signature = vec![0u8; sign_op.signature_len().unwrap()];
+        sign_op.sign(data, &mut signature).expect("sign");
+
+        let mut verify_op =
+            entry.verify_new(&mech, &pubkey).expect("verify_new");
+        verify_op.verify(data, &signature).expect("verify");
+
+        // A plain (non-ph) verify of a ph-signed message must fail: they're
+        // genuinely different signature schemes (SHA-512-prehashed vs. not).
+        let plain_mech = no_param_mech(CKM_EDDSA);
+        let mut plain_verify = entry.verify_new(&plain_mech, &pubkey).unwrap();
+        assert!(plain_verify.verify(data, &signature).is_err());
     }
 
-    /// `CK_EDDSA_PARAMS` with a non-empty context (Ed25519ctx) must be
-    /// rejected -- there's no AWS-LC primitive for it (see the module doc
-    /// comment).
+    /// `CK_EDDSA_PARAMS` with a non-empty context (Ed25519ctx) is supported
+    /// via `ED25519ctx_sign`/`_verify` (see `check_params`'s doc comment).
     #[test]
-    fn ed25519ctx_is_rejected() {
+    #[cfg(not(feature = "fips"))]
+    fn ed25519ctx_sign_verify_round_trip() {
         let (mechs, _ot) = registered();
-        let (_pubkey, privkey) =
+        let (pubkey, privkey) =
             generate_keypair(&mechs, crate::ec::EDWARDS25519);
         let context = b"some context".to_vec();
         let params = CK_EDDSA_PARAMS {
@@ -825,9 +839,74 @@ mod tests {
             ulParameterLen: std::mem::size_of::<CK_EDDSA_PARAMS>() as CK_ULONG,
         };
         let entry = mechs.get(CKM_EDDSA).unwrap();
+        let data = b"ed25519ctx test message";
+
+        let mut sign_op = entry.sign_new(&mech, &privkey).expect("sign_new");
+        let mut signature = vec![0u8; sign_op.signature_len().unwrap()];
+        sign_op.sign(data, &mut signature).expect("sign");
+
+        let mut verify_op =
+            entry.verify_new(&mech, &pubkey).expect("verify_new");
+        verify_op.verify(data, &signature).expect("verify");
+
+        // A different context must fail verification.
+        let other_context = b"different context".to_vec();
+        let other_params = CK_EDDSA_PARAMS {
+            phFlag: CK_FALSE,
+            ulContextDataLen: other_context.len() as CK_ULONG,
+            pContextData: other_context.as_ptr() as *mut u8,
+        };
+        let other_mech = CK_MECHANISM {
+            mechanism: CKM_EDDSA,
+            pParameter: &other_params as *const _ as CK_VOID_PTR,
+            ulParameterLen: std::mem::size_of::<CK_EDDSA_PARAMS>() as CK_ULONG,
+        };
+        let mut verify_op2 = entry
+            .verify_new(&other_mech, &pubkey)
+            .expect("verify_new 2");
+        assert!(verify_op2.verify(data, &signature).is_err());
+    }
+
+    /// Under `fips`, Ed25519ph/Ed25519ctx must still be rejected exactly as
+    /// before (see `check_params`'s doc comment for why this is
+    /// deliberately not extended to fips builds).
+    #[test]
+    #[cfg(feature = "fips")]
+    fn ed25519ph_and_ctx_still_rejected_under_fips() {
+        let (mechs, _ot) = registered();
+        let (_pubkey, privkey) =
+            generate_keypair(&mechs, crate::ec::EDWARDS25519);
+        let entry = mechs.get(CKM_EDDSA).unwrap();
+
+        let ph_params = CK_EDDSA_PARAMS {
+            phFlag: CK_TRUE,
+            ulContextDataLen: 0,
+            pContextData: std::ptr::null_mut(),
+        };
+        let ph_mech = CK_MECHANISM {
+            mechanism: CKM_EDDSA,
+            pParameter: &ph_params as *const _ as CK_VOID_PTR,
+            ulParameterLen: std::mem::size_of::<CK_EDDSA_PARAMS>() as CK_ULONG,
+        };
         let err = entry
-            .sign_new(&mech, &privkey)
-            .expect_err("Ed25519ctx must be rejected: no AWS-LC primitive");
+            .sign_new(&ph_mech, &privkey)
+            .expect_err("Ed25519ph must still be rejected under fips");
+        assert_eq!(err.rv(), CKR_MECHANISM_PARAM_INVALID);
+
+        let context = b"some context".to_vec();
+        let ctx_params = CK_EDDSA_PARAMS {
+            phFlag: CK_FALSE,
+            ulContextDataLen: context.len() as CK_ULONG,
+            pContextData: context.as_ptr() as *mut u8,
+        };
+        let ctx_mech = CK_MECHANISM {
+            mechanism: CKM_EDDSA,
+            pParameter: &ctx_params as *const _ as CK_VOID_PTR,
+            ulParameterLen: std::mem::size_of::<CK_EDDSA_PARAMS>() as CK_ULONG,
+        };
+        let err = entry
+            .sign_new(&ctx_mech, &privkey)
+            .expect_err("Ed25519ctx must still be rejected under fips");
         assert_eq!(err.rv(), CKR_MECHANISM_PARAM_INVALID);
     }
 
