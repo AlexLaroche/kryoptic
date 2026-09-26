@@ -117,6 +117,106 @@ impl Ed25519Key {
         }
         Ok(())
     }
+
+    /// RFC 8032 Ed25519ctx: like [`Self::sign`], but with a non-empty
+    /// context string mixed into the signature (via `dom2`, unlike plain
+    /// Ed25519, which has no domain separation at all). AWS-LC's
+    /// `ED25519ctx_sign` itself rejects an empty `context` (`dom2`'s
+    /// `ED25519CTX_ALG` arm requires `context_len != 0`, confirmed against
+    /// `crypto/fipsmodule/curve25519/curve25519.c`), so this never needs to
+    /// duplicate that check.
+    pub fn sign_ctx(
+        &self,
+        msg: &[u8],
+        context: &[u8],
+    ) -> Result<[u8; 64], Error> {
+        let mut sig = [0u8; 64];
+        let ret = unsafe {
+            ffi::ED25519ctx_sign(
+                sig.as_mut_ptr(),
+                msg.as_ptr(),
+                msg.len(),
+                self.expanded_private.as_ptr(),
+                context.as_ptr(),
+                context.len(),
+            )
+        };
+        if ret != 1 {
+            return Err(Error::new(ErrorKind::WrapperError));
+        }
+        Ok(sig)
+    }
+
+    /// Inverse of [`Self::sign_ctx`].
+    pub fn verify_ctx(
+        public_key: &[u8; 32],
+        msg: &[u8],
+        sig: &[u8; 64],
+        context: &[u8],
+    ) -> Result<(), Error> {
+        let ret = unsafe {
+            ffi::ED25519ctx_verify(
+                msg.as_ptr(),
+                msg.len(),
+                sig.as_ptr(),
+                public_key.as_ptr(),
+                context.as_ptr(),
+                context.len(),
+            )
+        };
+        if ret != 1 {
+            return Err(Error::new(ErrorKind::VerifyFailed));
+        }
+        Ok(())
+    }
+
+    /// RFC 8032 Ed25519ph: like [`Self::sign`], but signs
+    /// SHA-512(`msg`) with `phflag=1` and an optional (possibly empty,
+    /// unlike Ed25519ctx) context string.
+    pub fn sign_ph(
+        &self,
+        msg: &[u8],
+        context: &[u8],
+    ) -> Result<[u8; 64], Error> {
+        let mut sig = [0u8; 64];
+        let ret = unsafe {
+            ffi::ED25519ph_sign(
+                sig.as_mut_ptr(),
+                msg.as_ptr(),
+                msg.len(),
+                self.expanded_private.as_ptr(),
+                context.as_ptr(),
+                context.len(),
+            )
+        };
+        if ret != 1 {
+            return Err(Error::new(ErrorKind::WrapperError));
+        }
+        Ok(sig)
+    }
+
+    /// Inverse of [`Self::sign_ph`].
+    pub fn verify_ph(
+        public_key: &[u8; 32],
+        msg: &[u8],
+        sig: &[u8; 64],
+        context: &[u8],
+    ) -> Result<(), Error> {
+        let ret = unsafe {
+            ffi::ED25519ph_verify(
+                msg.as_ptr(),
+                msg.len(),
+                sig.as_ptr(),
+                public_key.as_ptr(),
+                context.as_ptr(),
+                context.len(),
+            )
+        };
+        if ret != 1 {
+            return Err(Error::new(ErrorKind::VerifyFailed));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for Ed25519Key {
@@ -168,6 +268,61 @@ mod tests {
         // original's public key too (same keypair).
         let sig = key2.sign(b"consistency check");
         Ed25519Key::verify(&key1.public_key(), b"consistency check", &sig)
+            .unwrap();
+    }
+
+    #[test]
+    fn ctx_sign_verify_round_trip() {
+        let key = Ed25519Key::generate().unwrap();
+        let msg = b"ed25519ctx test message";
+        let context = b"some context";
+        let sig = key.sign_ctx(msg, context).unwrap();
+        Ed25519Key::verify_ctx(&key.public_key(), msg, &sig, context).unwrap();
+
+        // A different context must not verify.
+        assert!(Ed25519Key::verify_ctx(
+            &key.public_key(),
+            msg,
+            &sig,
+            b"different context"
+        )
+        .is_err());
+
+        // Ed25519ctx is a genuinely different scheme from plain Ed25519
+        // (dom2 changes the signed hash input) -- a ctx-signed message
+        // must not verify under plain ED25519_verify.
+        assert!(Ed25519Key::verify(&key.public_key(), msg, &sig).is_err());
+    }
+
+    #[test]
+    fn ctx_sign_rejects_empty_context() {
+        // RFC 8032: Ed25519ctx's context SHOULD NOT be empty; AWS-LC's own
+        // ED25519ctx_sign enforces this (confirmed against
+        // crypto/fipsmodule/curve25519/curve25519.c's dom2()).
+        let key = Ed25519Key::generate().unwrap();
+        assert!(key.sign_ctx(b"message", b"").is_err());
+    }
+
+    #[test]
+    fn ph_sign_verify_round_trip() {
+        let key = Ed25519Key::generate().unwrap();
+        let msg = b"ed25519ph test message";
+        let context = b"some context";
+
+        let sig = key.sign_ph(msg, context).unwrap();
+        Ed25519Key::verify_ph(&key.public_key(), msg, &sig, context).unwrap();
+        assert!(Ed25519Key::verify_ph(
+            &key.public_key(),
+            msg,
+            &sig,
+            b"different context"
+        )
+        .is_err());
+        assert!(Ed25519Key::verify(&key.public_key(), msg, &sig).is_err());
+
+        // Unlike Ed25519ctx, Ed25519ph's context may be empty.
+        let sig_empty_ctx = key.sign_ph(msg, b"").unwrap();
+        Ed25519Key::verify_ph(&key.public_key(), msg, &sig_empty_ctx, b"")
             .unwrap();
     }
 
