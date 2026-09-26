@@ -300,8 +300,18 @@ mod tests {
     /// (which every existing `awslc::eddsa`/`awslc::montgomery` test uses
     /// to sidestep this exact gap -- see e.g. `eddsa.rs`'s
     /// `ed448_sign_new_is_rejected` doc comment).
+    /// `key_type` is taken by reference, not by value: `CK_ATTRIBUTE.pValue`
+    /// is an untracked raw pointer, so a by-value parameter's address would
+    /// dangle the moment this function returns (its stack slot is gone,
+    /// unlike `params`/`value`, which point into the *caller's* storage).
+    /// Debug builds mostly don't reuse that slot before the caller reads
+    /// it, but release builds' optimizer does, corrupting the returned
+    /// template -- confirmed by CI failures specific to `--release` (`cargo
+    /// test` never exercises the old build-only job's release configs).
+    /// Callers pass `&CKK_EC_EDWARDS`/`&CKK_EC_MONTGOMERY` directly, whose
+    /// storage is the constant itself (`'static`), not a stack frame.
     fn raw_privkey_template(
-        key_type: CK_KEY_TYPE,
+        key_type: &CK_KEY_TYPE,
         params: &[u8],
         value: &[u8],
     ) -> Vec<CK_ATTRIBUTE> {
@@ -313,7 +323,7 @@ mod tests {
             },
             CK_ATTRIBUTE {
                 type_: CKA_KEY_TYPE,
-                pValue: &key_type as *const _ as CK_VOID_PTR,
+                pValue: key_type as *const _ as CK_VOID_PTR,
                 ulValueLen: std::mem::size_of::<CK_KEY_TYPE>() as CK_ULONG,
             },
             CK_ATTRIBUTE {
@@ -346,7 +356,7 @@ mod tests {
         let params =
             crate::ec::curvename_to_ec_params(crate::ec::EDWARDS25519).unwrap();
         let seed = [0x42u8; 32];
-        let template = raw_privkey_template(CKK_EC_EDWARDS, &params, &seed);
+        let template = raw_privkey_template(&CKK_EC_EDWARDS, &params, &seed);
 
         let factory = ot.get_obj_factory_from_key_template(&template).unwrap();
         let privkey = factory.create(&template).expect(
@@ -378,7 +388,7 @@ mod tests {
             crate::ec::curvename_to_ec_params(crate::ec::CURVE25519).unwrap();
         let scalar = [0x24u8; 32];
         let template =
-            raw_privkey_template(CKK_EC_MONTGOMERY, &params, &scalar);
+            raw_privkey_template(&CKK_EC_MONTGOMERY, &params, &scalar);
 
         let factory = ot.get_obj_factory_from_key_template(&template).unwrap();
         let privkey = factory.create(&template).expect(
@@ -414,7 +424,7 @@ mod tests {
         let params =
             crate::ec::curvename_to_ec_params(crate::ec::EDWARDS448).unwrap();
         let value = vec![0u8; crate::ec::ec_key_size(&oid::ED448_OID).unwrap()];
-        let template = raw_privkey_template(CKK_EC_EDWARDS, &params, &value);
+        let template = raw_privkey_template(&CKK_EC_EDWARDS, &params, &value);
 
         let factory = ot.get_obj_factory_from_key_template(&template).unwrap();
         let err = factory.create(&template).expect_err(
@@ -435,7 +445,8 @@ mod tests {
         let params =
             crate::ec::curvename_to_ec_params(crate::ec::CURVE448).unwrap();
         let value = vec![0u8; crate::ec::ec_key_size(&oid::X448_OID).unwrap()];
-        let template = raw_privkey_template(CKK_EC_MONTGOMERY, &params, &value);
+        let template =
+            raw_privkey_template(&CKK_EC_MONTGOMERY, &params, &value);
 
         let factory = ot.get_obj_factory_from_key_template(&template).unwrap();
         let err = factory.create(&template).expect_err(
