@@ -186,7 +186,20 @@ pub fn extract_public_key(privkey: &Object) -> Result<Vec<u8>> {
             let curve_oid = crate::ec::get_oid_from_obj(privkey)?;
             let curve = ec_curve_from_oid(&curve_oid)?;
             let scalar = privkey.get_attr_as_bytes(CKA_VALUE)?;
-            let key = EcKey::from_private_scalar(curve, scalar.as_slice())?;
+            // AWS-LC's EC_KEY_set_private_key validates 0 < d < order (a
+            // stricter check than OpenSSL's own equivalent, which stores
+            // the scalar unchecked and only fails, if at all, once it's
+            // actually used) -- so a syntactically well-formed but
+            // out-of-range scalar (e.g. a deliberately-invalid CAVP test
+            // vector) fails here. `CKR_KEY_UNEXTRACTABLE` is the same
+            // tolerated error `ECDSAPrivFactory::create`/`EDDSAPrivFactory::
+            // create`/`ECMontgomeryPrivFactory::create` (src/ec/*.rs) already
+            // special-case and continue past for the pre-existing "older
+            // OpenSSL can't extract this key" gap -- reusing it here lets
+            // import succeed and defers the actual invalidity to first use
+            // (signing/deriving), matching the reference backend's behavior.
+            let key = EcKey::from_private_scalar(curve, scalar.as_slice())
+                .map_err(|_| CKR_KEY_UNEXTRACTABLE)?;
             Ok(key.public_point())
         }
         #[cfg(feature = "eddsa")]
