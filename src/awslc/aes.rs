@@ -1176,12 +1176,44 @@ impl AesOperation {
         Ok(result?)
     }
 
+    /// Parses `mech.pParameter` as `CKM_AES_KEY_WRAP`/`_PKCS7`'s optional
+    /// 8-byte custom IV: absent (`ulParameterLen == 0`) means "use RFC
+    /// 3394's default", any other length is invalid.
+    fn parse_kw_iv(mech: &CK_MECHANISM) -> Result<Option<[u8; 8]>> {
+        match mech.ulParameterLen {
+            0 => Ok(None),
+            8 => {
+                let mut iv = [0u8; 8];
+                iv.copy_from_slice(&bytes_to_vec(mech.pParameter, 8));
+                Ok(Some(iv))
+            }
+            _ => Err(CKR_MECHANISM_PARAM_INVALID)?,
+        }
+    }
+
+    /// Parses `mech.pParameter` as `CKM_AES_KEY_WRAP_KWP`'s optional 4-byte
+    /// custom AIV prefix: absent (`ulParameterLen == 0`) means "use RFC
+    /// 5649's default constant", any other length is invalid.
+    fn parse_kwp_prefix(mech: &CK_MECHANISM) -> Result<Option<[u8; 4]>> {
+        match mech.ulParameterLen {
+            0 => Ok(None),
+            4 => {
+                let mut prefix = [0u8; 4];
+                prefix.copy_from_slice(&bytes_to_vec(mech.pParameter, 4));
+                Ok(Some(prefix))
+            }
+            _ => Err(CKR_MECHANISM_PARAM_INVALID)?,
+        }
+    }
+
     /// Plain RFC 3394 wrap for `CKM_AES_KEY_WRAP`. `keydata` must already be
     /// a multiple of one semiblock (8 bytes); unlike PKCS7/KWP this
-    /// mechanism does not pad.
+    /// mechanism does not pad. `iv` is the optional caller-supplied 8-byte
+    /// IV from `mech.pParameter` (`None` uses RFC 3394's default).
     fn wrap_plain(
         kw: &AesKeyWrap,
         keydata: &[u8],
+        iv: Option<&[u8; 8]>,
         output: &mut [u8],
     ) -> Result<usize> {
         if keydata.len() == 0 || keydata.len() % AES_KW_SEMIBLOCK != 0 {
@@ -1194,7 +1226,9 @@ impl AesOperation {
         if output.len() < needed {
             return Err(Error::buf_too_small(needed));
         }
-        let n = kw.wrap(keydata, output).map_err(|_| CKR_DATA_LEN_RANGE)?;
+        let n = kw
+            .wrap_with_iv(iv, keydata, output)
+            .map_err(|_| CKR_DATA_LEN_RANGE)?;
         Ok(n)
     }
 
@@ -1208,6 +1242,7 @@ impl AesOperation {
     fn wrap_pkcs7(
         kw: &AesKeyWrap,
         keydata: &mut Vec<u8>,
+        iv: Option<&[u8; 8]>,
         output: &mut [u8],
     ) -> Result<usize> {
         if keydata.len() < AES_KW_SEMIBLOCK {
@@ -1223,7 +1258,9 @@ impl AesOperation {
             return Err(Error::buf_too_small(needed));
         }
         keydata.resize(padded_len, pad as u8);
-        let n = kw.wrap(keydata, output).map_err(|_| CKR_DATA_LEN_RANGE)?;
+        let n = kw
+            .wrap_with_iv(iv, keydata, output)
+            .map_err(|_| CKR_DATA_LEN_RANGE)?;
         Ok(n)
     }
 
@@ -1232,6 +1269,7 @@ impl AesOperation {
     fn wrap_kwp(
         kw: &AesKeyWrap,
         keydata: &[u8],
+        prefix: Option<[u8; 4]>,
         output: &mut [u8],
     ) -> Result<usize> {
         // Mirrors `crate::ossl::aes::AesOperation::encryption_len`'s
@@ -1245,9 +1283,11 @@ impl AesOperation {
         if output.len() < needed {
             return Err(Error::buf_too_small(needed));
         }
-        let n = kw
-            .wrap_padded(keydata, output)
-            .map_err(|_| CKR_DATA_LEN_RANGE)?;
+        let n = match prefix {
+            Some(p) => kw.wrap_padded_with_prefix(p, keydata, output),
+            None => kw.wrap_padded(keydata, output),
+        }
+        .map_err(|_| CKR_DATA_LEN_RANGE)?;
         Ok(n)
     }
 
@@ -1269,21 +1309,19 @@ impl AesOperation {
     /// wrap, with PKCS7 applying its own byte-padding to the plaintext
     /// first; `CKM_AES_KEY_WRAP_KWP` uses RFC 5649's padded wrap directly.
     ///
-    /// A custom initial value (`mech.pParameter`, which the reference
-    /// optionally honors for CKM_AES_KEY_WRAP/_PKCS7/_KWP) is not
-    /// supported -- `awslc::cipher::AesKeyWrap` always uses the RFC
-    /// 3394/5649 default IV -- so a non-empty parameter is rejected rather
-    /// than silently ignored.
+    /// A custom initial value (`mech.pParameter`) is supported for all
+    /// three mechanisms, matching the reference: an 8-byte IV for
+    /// `CKM_AES_KEY_WRAP`/`_PKCS7` (RFC 3394's own `AES_wrap_key` IV
+    /// parameter), and a 4-byte AIV prefix for `CKM_AES_KEY_WRAP_KWP`
+    /// (RFC 5649's customizable constant, replacing its fixed default --
+    /// the AIV's other 4 bytes always carry the real data length, which
+    /// isn't customizable).
     pub fn wrap(
         mech: &CK_MECHANISM,
         wrapping_key: &Object,
         mut keydata: Vec<u8>,
         output: &mut [u8],
     ) -> Result<usize> {
-        if mech.ulParameterLen != 0 {
-            zeromem(&mut keydata);
-            return Err(CKR_MECHANISM_PARAM_INVALID)?;
-        }
         let kw = match Self::key_wrap_cipher(wrapping_key) {
             Ok(kw) => kw,
             Err(e) => {
@@ -1292,11 +1330,20 @@ impl AesOperation {
             }
         };
         let result = match mech.mechanism {
-            CKM_AES_KEY_WRAP => Self::wrap_plain(&kw, &keydata, output),
-            CKM_AES_KEY_WRAP_PKCS7 => {
-                Self::wrap_pkcs7(&kw, &mut keydata, output)
-            }
-            CKM_AES_KEY_WRAP_KWP => Self::wrap_kwp(&kw, &keydata, output),
+            CKM_AES_KEY_WRAP => match Self::parse_kw_iv(mech) {
+                Ok(iv) => Self::wrap_plain(&kw, &keydata, iv.as_ref(), output),
+                Err(e) => Err(e),
+            },
+            CKM_AES_KEY_WRAP_PKCS7 => match Self::parse_kw_iv(mech) {
+                Ok(iv) => {
+                    Self::wrap_pkcs7(&kw, &mut keydata, iv.as_ref(), output)
+                }
+                Err(e) => Err(e),
+            },
+            CKM_AES_KEY_WRAP_KWP => match Self::parse_kwp_prefix(mech) {
+                Ok(prefix) => Self::wrap_kwp(&kw, &keydata, prefix, output),
+                Err(e) => Err(e),
+            },
             // Every mechanism the shared `crate::aes::AES_MECHS` table
             // grants CKF_WRAP to besides the CKM_AES_KEY_WRAP* family
             // lands here (ECB/CBC/CBC-PAD/CTR/CTS and GCM/CCM: see
@@ -1323,14 +1370,18 @@ impl AesOperation {
     /// wrapped blob is 24 bytes (a 16-byte minimum plaintext plus the
     /// 8-byte integrity/IV overhead), and both wrapped and unwrapped
     /// lengths are always multiples of one semiblock.
-    fn unwrap_plain(kw: &AesKeyWrap, data: &[u8]) -> Result<Vec<u8>> {
+    fn unwrap_plain(
+        kw: &AesKeyWrap,
+        data: &[u8],
+        iv: Option<&[u8; 8]>,
+    ) -> Result<Vec<u8>> {
         if data.len() % AES_KW_SEMIBLOCK != 0
             || data.len() < AES_KW_SEMIBLOCK * 3
         {
             return Err(CKR_ENCRYPTED_DATA_LEN_RANGE)?;
         }
         let mut out = vec![0u8; data.len() - AES_KW_SEMIBLOCK];
-        match kw.unwrap(data, &mut out) {
+        match kw.unwrap_with_iv(iv, data, &mut out) {
             Ok(n) => {
                 out.truncate(n);
                 Ok(out)
@@ -1343,12 +1394,20 @@ impl AesOperation {
     }
 
     /// RFC 5649 padded unwrap for `CKM_AES_KEY_WRAP_KWP`.
-    fn unwrap_kwp(kw: &AesKeyWrap, data: &[u8]) -> Result<Vec<u8>> {
+    fn unwrap_kwp(
+        kw: &AesKeyWrap,
+        data: &[u8],
+        prefix: Option<[u8; 4]>,
+    ) -> Result<Vec<u8>> {
         if data.len() % AES_KW_SEMIBLOCK != 0 || data.len() < AES_BLOCK_SIZE {
             return Err(CKR_ENCRYPTED_DATA_LEN_RANGE)?;
         }
         let mut out = vec![0u8; data.len()];
-        match kw.unwrap_padded(data, &mut out) {
+        let result = match prefix {
+            Some(p) => kw.unwrap_padded_with_prefix(p, data, &mut out),
+            None => kw.unwrap_padded(data, &mut out),
+        };
+        match result {
             Ok(n) => {
                 out.truncate(n);
                 Ok(out)
@@ -1368,14 +1427,18 @@ impl AesOperation {
     /// branching on the padding byte's value, which is attacker-influenced
     /// since it comes from data just authenticated by the wrap integrity
     /// check but is not itself independently trusted length metadata).
-    fn unwrap_pkcs7(kw: &AesKeyWrap, data: &[u8]) -> Result<Vec<u8>> {
+    fn unwrap_pkcs7(
+        kw: &AesKeyWrap,
+        data: &[u8],
+        iv: Option<&[u8; 8]>,
+    ) -> Result<Vec<u8>> {
         if data.len() % AES_KW_SEMIBLOCK != 0
             || data.len() < AES_KW_SEMIBLOCK * 3
         {
             return Err(CKR_ENCRYPTED_DATA_LEN_RANGE)?;
         }
         let mut unwrapped = vec![0u8; data.len() - AES_KW_SEMIBLOCK];
-        let n = match kw.unwrap(data, &mut unwrapped) {
+        let n = match kw.unwrap_with_iv(iv, data, &mut unwrapped) {
             Ok(n) => n,
             Err(_) => {
                 zeromem(&mut unwrapped);
@@ -1417,20 +1480,23 @@ impl AesOperation {
     /// Instantiates a new AES Key-Unwrap operation and performs the unwrap
     /// in one shot. See `wrap`'s doc comment for the structural rationale
     /// (a distinct `AesKeyWrap` primitive rather than `ClassicMode`) and
-    /// the same custom-IV limitation.
+    /// custom-IV support.
     pub fn unwrap(
         mech: &CK_MECHANISM,
         wrapping_key: &Object,
         data: &[u8],
     ) -> Result<Vec<u8>> {
-        if mech.ulParameterLen != 0 {
-            return Err(CKR_MECHANISM_PARAM_INVALID)?;
-        }
         let kw = Self::key_wrap_cipher(wrapping_key)?;
         match mech.mechanism {
-            CKM_AES_KEY_WRAP => Self::unwrap_plain(&kw, data),
-            CKM_AES_KEY_WRAP_PKCS7 => Self::unwrap_pkcs7(&kw, data),
-            CKM_AES_KEY_WRAP_KWP => Self::unwrap_kwp(&kw, data),
+            CKM_AES_KEY_WRAP => {
+                Self::unwrap_plain(&kw, data, Self::parse_kw_iv(mech)?.as_ref())
+            }
+            CKM_AES_KEY_WRAP_PKCS7 => {
+                Self::unwrap_pkcs7(&kw, data, Self::parse_kw_iv(mech)?.as_ref())
+            }
+            CKM_AES_KEY_WRAP_KWP => {
+                Self::unwrap_kwp(&kw, data, Self::parse_kwp_prefix(mech)?)
+            }
             // Mirrors `wrap`'s own fallback arm above: CBC/ECB/CTR/CTS and
             // GCM/CCM also carry CKF_UNWRAP in the shared mechanism-info
             // table, but this backend deliberately does not support
