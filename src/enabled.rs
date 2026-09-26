@@ -55,9 +55,16 @@ mod mlkem;
 mod mldsa;
 
 // In fips builds enable slhdsa only if ossl400 was selected, which is required
-// for deferred self tests
+// for deferred self tests. Never for awslc/awslc-fips: AWS-LC has no SLH-DSA/
+// SPHINCS+ primitive at all (confirmed against aws-lc-sys's public headers --
+// no matching symbols anywhere, for either backend variant), so this is
+// excluded outright rather than relying on the ossl400 check above, which is
+// an OpenSSL-FIPS-module-specific requirement that says nothing about this
+// backend (and, unlike awslc-fips, plain awslc doesn't imply `fips` at all,
+// so that check alone doesn't protect it).
 #[cfg(all(
     feature = "slhdsa",
+    not(any(feature = "awslc", feature = "awslc-fips")),
     any(not(feature = "fips"), feature = "ossl400")
 ))]
 mod slhdsa;
@@ -132,6 +139,7 @@ fn register_all(mechs: &mut Mechanisms, ot: &mut ObjectFactories) {
 
     #[cfg(all(
         feature = "slhdsa",
+        not(any(feature = "awslc", feature = "awslc-fips")),
         any(not(feature = "fips"), feature = "ossl400")
     ))]
     slhdsa::register(mechs, ot);

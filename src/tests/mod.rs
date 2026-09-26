@@ -412,6 +412,7 @@ mod mldsa;
 
 #[cfg(all(
     feature = "slhdsa",
+    not(any(feature = "awslc", feature = "awslc-fips")),
     any(not(feature = "fips"), feature = "ossl400")
 ))]
 mod slhdsa;

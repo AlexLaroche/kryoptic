@@ -829,6 +829,7 @@ fn test_derive_pub_from_priv() {
 
     #[cfg(all(
         feature = "slhdsa",
+        not(any(feature = "awslc", feature = "awslc-fips")),
         any(not(feature = "fips"), feature = "ossl400")
     ))]
     test_cases.push(TestCase {
