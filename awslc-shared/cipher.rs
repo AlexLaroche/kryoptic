@@ -642,6 +642,10 @@ impl Drop for AesCcm {
 unsafe impl Send for AesCcm {}
 unsafe impl Sync for AesCcm {}
 
+/// The AES block size, and also RFC 5649's single-block special-case
+/// threshold for its padded key wrap.
+const AES_KW_BLOCK: usize = 16;
+
 #[derive(Debug)]
 pub struct AesKeyWrap {
     encrypt_key: ffi::AES_KEY,
@@ -676,15 +680,34 @@ impl AesKeyWrap {
     /// least 16 bytes (the caller -- src/awslc/aes.rs -- is responsible for
     /// applying PKCS7 padding first for CKM_AES_KEY_WRAP_PKCS7, since that
     /// mechanism uses plain KW under PKCS7-padded input, not KWP's AIV
-    /// mechanism).
+    /// mechanism). Uses RFC 3394's default IV; see [`Self::wrap_with_iv`]
+    /// for a caller-supplied one.
     pub fn wrap(&self, data: &[u8], out: &mut [u8]) -> Result<usize, Error> {
+        self.wrap_with_iv(None, data, out)
+    }
+
+    /// Same as [`Self::wrap`], but with an explicit 8-byte IV instead of
+    /// RFC 3394's default (`None` still means "use the default"). Also the
+    /// building block [`Self::wrap_padded_with_prefix`] uses to implement a
+    /// custom RFC 5649 AIV, since AWS-LC's own `AES_wrap_key_padded` always
+    /// hardcodes RFC 5649's fixed constant and has no such parameter.
+    pub fn wrap_with_iv(
+        &self,
+        iv: Option<&[u8; 8]>,
+        data: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, Error> {
         if out.len() < data.len() + 8 {
             return Err(Error::new(ErrorKind::BufferSize));
         }
+        let iv_ptr = match iv {
+            Some(v) => v.as_ptr(),
+            None => std::ptr::null(),
+        };
         let n = unsafe {
             ffi::AES_wrap_key(
                 &self.encrypt_key,
-                std::ptr::null(),
+                iv_ptr,
                 out.as_mut_ptr(),
                 data.as_ptr(),
                 data.len(),
@@ -696,14 +719,33 @@ impl AesKeyWrap {
         Ok(usize::try_from(n).unwrap())
     }
 
+    /// Uses RFC 3394's default IV; see [`Self::unwrap_with_iv`] for a
+    /// caller-supplied one.
     pub fn unwrap(&self, data: &[u8], out: &mut [u8]) -> Result<usize, Error> {
+        self.unwrap_with_iv(None, data, out)
+    }
+
+    /// Same as [`Self::unwrap`], but verifies against an explicit 8-byte IV
+    /// instead of RFC 3394's default (`None` still means "use the
+    /// default"). Also the building block [`Self::unwrap_padded_with_prefix`]
+    /// uses to verify a custom RFC 5649 AIV.
+    pub fn unwrap_with_iv(
+        &self,
+        iv: Option<&[u8; 8]>,
+        data: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, Error> {
         if data.len() < 8 || out.len() < data.len() - 8 {
             return Err(Error::new(ErrorKind::BufferSize));
         }
+        let iv_ptr = match iv {
+            Some(v) => v.as_ptr(),
+            None => std::ptr::null(),
+        };
         let n = unsafe {
             ffi::AES_unwrap_key(
                 &self.decrypt_key,
-                std::ptr::null(),
+                iv_ptr,
                 out.as_mut_ptr(),
                 data.as_ptr(),
                 data.len(),
@@ -759,6 +801,137 @@ impl AesKeyWrap {
             return Err(Error::new(ErrorKind::VerifyFailed));
         }
         Ok(outlen)
+    }
+
+    /// RFC 5649 key wrap with padding, using a caller-supplied 4-byte AIV
+    /// prefix instead of RFC 5649 section 3's fixed constant (0xA65959A6).
+    /// Mirrors AWS-LC's own `AES_wrap_key_padded`
+    /// (`crypto/fipsmodule/aes/key_wrap.c`) exactly -- that C function
+    /// itself builds an 8-byte AIV (a fixed 4-byte constant || the
+    /// big-endian input length) and, for inputs over 8 bytes, feeds it
+    /// straight into `AES_wrap_key`'s own `iv` parameter; for inputs of 8
+    /// bytes or fewer it does one raw AES-ECB block encryption of
+    /// `AIV || zero-padded input` instead. Both cases are reproduced here
+    /// using [`Self::wrap_with_iv`] (which exposes that same `iv`
+    /// parameter) and a direct `AES_encrypt` call, with only the AIV's
+    /// leading 4 bytes swapped for `prefix`.
+    pub fn wrap_padded_with_prefix(
+        &self,
+        prefix: [u8; 4],
+        data: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, Error> {
+        if data.is_empty() || data.len() > u32::MAX as usize {
+            return Err(Error::new(ErrorKind::WrapperError));
+        }
+        let mut aiv = [0u8; 8];
+        aiv[..4].copy_from_slice(&prefix);
+        aiv[4..].copy_from_slice(&(data.len() as u32).to_be_bytes());
+
+        if data.len() <= 8 {
+            if out.len() < AES_KW_BLOCK {
+                return Err(Error::new(ErrorKind::BufferSize));
+            }
+            let mut block = [0u8; AES_KW_BLOCK];
+            block[..8].copy_from_slice(&aiv);
+            block[8..8 + data.len()].copy_from_slice(data);
+            unsafe {
+                ffi::AES_encrypt(
+                    block.as_ptr(),
+                    out.as_mut_ptr(),
+                    &self.encrypt_key,
+                );
+            }
+            zeromem(&mut block);
+            return Ok(AES_KW_BLOCK);
+        }
+
+        let padded_len = (data.len() + 7) & !7;
+        let mut padded = vec![0u8; padded_len];
+        padded[..data.len()].copy_from_slice(data);
+        let result = self.wrap_with_iv(Some(&aiv), &padded, out);
+        zeromem(&mut padded);
+        result
+    }
+
+    /// Inverse of [`Self::wrap_padded_with_prefix`]. Since AWS-LC exposes
+    /// no way to recover the AIV an unwrap actually computed (only whether
+    /// it matches a caller-supplied one, via the public `AES_unwrap_key`),
+    /// and the true input length isn't known until after unwrapping, this
+    /// tries each of the (at most 8) lengths RFC 5649 padding allows for
+    /// this ciphertext size as a candidate AIV, via [`Self::unwrap_with_iv`]
+    /// -- which performs AWS-LC's own real, tested unwrap-and-verify for
+    /// each -- and accepts the one that both verifies and has all-zero
+    /// padding bytes beyond the claimed length. This still does the exact
+    /// same verification RFC 5649 requires; it just restructures AWS-LC's
+    /// internal "compute once, compare once" as "compare against each
+    /// candidate", since only the former is reachable through AWS-LC's
+    /// public API.
+    pub fn unwrap_padded_with_prefix(
+        &self,
+        prefix: [u8; 4],
+        data: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, Error> {
+        if data.len() < AES_KW_BLOCK || data.len() % 8 != 0 {
+            return Err(Error::new(ErrorKind::VerifyFailed));
+        }
+
+        if data.len() == AES_KW_BLOCK {
+            let mut block = [0u8; AES_KW_BLOCK];
+            unsafe {
+                ffi::AES_decrypt(
+                    data.as_ptr(),
+                    block.as_mut_ptr(),
+                    &self.decrypt_key,
+                );
+            }
+            let claimed_len = u32::from_be_bytes(
+                block[4..8].try_into().unwrap(),
+            ) as usize;
+            let ok = block[..4] == prefix
+                && (1..=8).contains(&claimed_len)
+                && block[8 + claimed_len..16].iter().all(|&b| b == 0);
+            if !ok {
+                zeromem(&mut block);
+                return Err(Error::new(ErrorKind::VerifyFailed));
+            }
+            if out.len() < claimed_len {
+                zeromem(&mut block);
+                return Err(Error::new(ErrorKind::BufferSize));
+            }
+            out[..claimed_len].copy_from_slice(&block[8..8 + claimed_len]);
+            zeromem(&mut block);
+            return Ok(claimed_len);
+        }
+
+        let padded_len = data.len() - 8;
+        let min_len = padded_len - 7;
+        let mut padded_out = vec![0u8; padded_len];
+        let mut found: Option<usize> = None;
+        for l in min_len..=padded_len {
+            let mut aiv = [0u8; 8];
+            aiv[..4].copy_from_slice(&prefix);
+            aiv[4..].copy_from_slice(&(l as u32).to_be_bytes());
+            if self
+                .unwrap_with_iv(Some(&aiv), data, &mut padded_out)
+                .is_ok()
+                && padded_out[l..].iter().all(|&b| b == 0)
+            {
+                found = Some(l);
+                break;
+            }
+        }
+        let result = match found {
+            Some(l) if out.len() >= l => {
+                out[..l].copy_from_slice(&padded_out[..l]);
+                Ok(l)
+            }
+            Some(_) => Err(Error::new(ErrorKind::BufferSize)),
+            None => Err(Error::new(ErrorKind::VerifyFailed)),
+        };
+        zeromem(&mut padded_out);
+        result
     }
 }
 
@@ -1121,5 +1294,108 @@ mod tests {
         let mut unwrapped = vec![0u8; n];
         let n2 = kw.unwrap_padded(&wrapped[..n], &mut unwrapped).unwrap();
         assert_eq!(&unwrapped[..n2], &key_data[..]);
+    }
+
+    /// RFC 5649's own fixed constant, matching AWS-LC's `kPaddingConstant`
+    /// (`crypto/fipsmodule/aes/key_wrap.c`) -- used to check that the
+    /// custom-prefix path produces byte-identical output to (and correctly
+    /// unwraps output from) AWS-LC's own trusted `AES_wrap_key_padded`/
+    /// `AES_unwrap_key_padded` when given that same default prefix.
+    const RFC5649_DEFAULT_PREFIX: [u8; 4] = [0xa6, 0x59, 0x59, 0xa6];
+
+    #[test]
+    fn kwp_custom_prefix_matches_default_when_prefix_is_default() {
+        let kek = [0x22u8; 16];
+        let kw = AesKeyWrap::new(&kek).unwrap();
+        for key_data in [
+            &b"x"[..],
+            &b"exactly8"[..],
+            &b"odd length key material, not a multiple of 8"[..],
+            &[0x5Au8; 32][..],
+        ] {
+            let mut wrapped_ref = vec![0u8; key_data.len() + 16];
+            let n_ref = kw.wrap_padded(key_data, &mut wrapped_ref).unwrap();
+
+            let mut wrapped_custom = vec![0u8; key_data.len() + 16];
+            let n_custom = kw
+                .wrap_padded_with_prefix(
+                    RFC5649_DEFAULT_PREFIX,
+                    key_data,
+                    &mut wrapped_custom,
+                )
+                .unwrap();
+            assert_eq!(&wrapped_custom[..n_custom], &wrapped_ref[..n_ref]);
+
+            // And the custom-prefix unwrap must recover AWS-LC's own
+            // wrapped output.
+            let mut unwrapped = vec![0u8; key_data.len()];
+            let n2 = kw
+                .unwrap_padded_with_prefix(
+                    RFC5649_DEFAULT_PREFIX,
+                    &wrapped_ref[..n_ref],
+                    &mut unwrapped,
+                )
+                .unwrap();
+            assert_eq!(&unwrapped[..n2], key_data);
+        }
+    }
+
+    #[test]
+    fn kwp_custom_prefix_round_trip() {
+        let kek = [0x33u8; 24];
+        let kw = AesKeyWrap::new(&kek).unwrap();
+        let prefix = [0xCC, 0xCC, 0xCC, 0xCC];
+        for key_data in [
+            &b"x"[..],
+            &b"exactly8"[..],
+            &b"a custom-IV wrapped RSA key, e.g."[..],
+        ] {
+            let mut wrapped = vec![0u8; key_data.len() + 16];
+            let n = kw
+                .wrap_padded_with_prefix(prefix, key_data, &mut wrapped)
+                .unwrap();
+
+            let mut unwrapped = vec![0u8; key_data.len()];
+            let n2 = kw
+                .unwrap_padded_with_prefix(
+                    prefix,
+                    &wrapped[..n],
+                    &mut unwrapped,
+                )
+                .unwrap();
+            assert_eq!(&unwrapped[..n2], key_data);
+
+            // A different prefix than the one used to wrap must not verify.
+            let mut rejected = vec![0u8; key_data.len()];
+            assert!(kw
+                .unwrap_padded_with_prefix(
+                    RFC5649_DEFAULT_PREFIX,
+                    &wrapped[..n],
+                    &mut rejected,
+                )
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn kw_custom_iv_round_trip_and_rejects_wrong_iv() {
+        let kek = [0x44u8; 16];
+        let kw = AesKeyWrap::new(&kek).unwrap();
+        let key_data = [0xABu8; 16];
+        let iv = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+
+        let mut wrapped = [0u8; 24];
+        let n = kw
+            .wrap_with_iv(Some(&iv), &key_data, &mut wrapped)
+            .unwrap();
+        assert_eq!(n, 24);
+
+        // Default-IV unwrap of a custom-IV wrap must fail the IV check.
+        let mut out = [0u8; 16];
+        assert!(kw.unwrap(&wrapped, &mut out).is_err());
+
+        let n2 = kw.unwrap_with_iv(Some(&iv), &wrapped, &mut out).unwrap();
+        assert_eq!(n2, 16);
+        assert_eq!(out, key_data);
     }
 }
