@@ -48,14 +48,25 @@ impl EcKey {
         Ok(EcKey { key, curve })
     }
 
-    /// Reconstructs a key from a raw, fixed-width private scalar (matching
-    /// PKCS#11's CKA_VALUE for CKK_EC). Also derives and sets the public
-    /// point, since EC_KEY_set_private_key alone doesn't compute it.
+    /// Reconstructs a key from a raw private scalar (matching PKCS#11's
+    /// CKA_VALUE for CKK_EC: a big-endian integer that may carry extra
+    /// leading zero bytes -- either stripped down to a minimal encoding, or
+    /// padded out with them, depending on the producer -- so its
+    /// significant length can be anywhere from 1 up to `order_bytes()`,
+    /// not always exactly `order_bytes()`). Also derives and sets the
+    /// public point, since EC_KEY_set_private_key alone doesn't compute it.
     pub fn from_private_scalar(
         curve: EcCurve,
         scalar: &[u8],
     ) -> Result<EcKey, Error> {
-        if scalar.len() != curve.order_bytes() {
+        let significant = {
+            let mut s = scalar;
+            while s.len() > 1 && s[0] == 0 {
+                s = &s[1..];
+            }
+            s
+        };
+        if scalar.is_empty() || significant.len() > curve.order_bytes() {
             return Err(Error::new(ErrorKind::WrapperError));
         }
         let key = unsafe { ffi::EC_KEY_new_by_curve_name(curve.nid()) };

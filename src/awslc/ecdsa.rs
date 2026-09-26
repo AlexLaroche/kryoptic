@@ -48,7 +48,8 @@ fn ec_curve_from_obj(key: &Object) -> Result<EcCurve> {
 }
 
 /// Builds an `EcKey` for signing from a `CKO_PRIVATE_KEY` `Object`'s
-/// `CKA_VALUE` (raw fixed-width private scalar -- exactly
+/// `CKA_VALUE` (raw private scalar, possibly shorter than the curve's
+/// order width if leading zero bytes were stripped -- exactly
 /// `EcKey::from_private_scalar`'s expected input format, no conversion
 /// needed).
 fn privkey_from_object(key: &Object) -> Result<EcKey> {
