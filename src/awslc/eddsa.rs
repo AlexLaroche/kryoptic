@@ -51,6 +51,9 @@ use crate::mechanism::*;
 use crate::object::Object;
 use crate::pkcs11::*;
 
+#[cfg(not(feature = "fips"))]
+use crate::misc::bytes_to_vec;
+
 use crate::lowlevel::eddsa::Ed25519Key;
 
 #[cfg(feature = "fips")]
@@ -77,27 +80,68 @@ pub(crate) fn ensure_ed25519(key: &Object) -> Result<()> {
     }
 }
 
+/// Which RFC 8032 EdDSA variant an operation is using. AWS-LC's raw
+/// `ED25519ctx_sign`/`ED25519ph_sign` primitives (see
+/// `crate::lowlevel::eddsa::Ed25519Key::sign_ctx`/`sign_ph`) make both
+/// variants real, not hand-rolled -- unlike the module doc comment's older
+/// claim (written against an earlier AWS-LC version that didn't export
+/// them).
+#[derive(Debug, Clone)]
+enum EddsaVariant {
+    /// Plain (pure) Ed25519: empty context, no prehashing.
+    Plain,
+    /// Ed25519ctx: a non-empty context, no prehashing.
+    #[cfg(not(feature = "fips"))]
+    Ctx(Vec<u8>),
+    /// Ed25519ph: message is SHA-512-prehashed; context may be empty.
+    #[cfg(not(feature = "fips"))]
+    Ph(Vec<u8>),
+}
+
 /// Parses mechanism parameters for EdDSA operations, mirroring
-/// `crate::ossl::eddsa::parse_params`'s role but restricted to the single
-/// variant AWS-LC's raw primitive supports: plain (pure) Ed25519 with an
-/// empty context and no prehashing (see the module doc comment).
-fn check_params(mech: &CK_MECHANISM) -> Result<()> {
+/// `crate::ossl::eddsa::parse_params`'s role.
+///
+/// Under `fips`, this keeps the original, narrower behavior (only plain
+/// Ed25519 is accepted, matching `src/tests/eddsa.rs`'s own
+/// `cfg!(feature = "fips")` branch, which expects `CKR_MECHANISM_PARAM_
+/// INVALID` for Ed25519ctx even on backends that otherwise support it --
+/// presumably because the reference OpenSSL FIPS module doesn't approve
+/// it either) -- not because AWS-LC's FIPS module lacks these primitives
+/// (it doesn't check that), but to avoid changing this backend's FIPS
+/// approval surface as a side effect of closing this gap.
+fn check_params(mech: &CK_MECHANISM) -> Result<EddsaVariant> {
     if mech.mechanism != CKM_EDDSA {
         return Err(CKR_MECHANISM_INVALID)?;
     }
     if mech.ulParameterLen == 0 {
-        return Ok(());
+        return Ok(EddsaVariant::Plain);
     }
     let params = mech.get_parameters::<CK_EDDSA_PARAMS>()?;
-    if params.phFlag == CK_TRUE {
-        /* Ed25519ph: no AWS-LC primitive for this. */
-        return Err(CKR_MECHANISM_PARAM_INVALID)?;
+    #[cfg(feature = "fips")]
+    {
+        if params.phFlag == CK_TRUE || params.ulContextDataLen != 0 {
+            return Err(CKR_MECHANISM_PARAM_INVALID)?;
+        }
+        Ok(EddsaVariant::Plain)
     }
-    if params.ulContextDataLen != 0 {
-        /* Ed25519ctx: no AWS-LC primitive for this either. */
-        return Err(CKR_MECHANISM_PARAM_INVALID)?;
+    #[cfg(not(feature = "fips"))]
+    {
+        let context = if params.ulContextDataLen == 0 {
+            Vec::new()
+        } else {
+            bytes_to_vec(
+                params.pContextData,
+                usize::try_from(params.ulContextDataLen)?,
+            )
+        };
+        if params.phFlag == CK_TRUE {
+            Ok(EddsaVariant::Ph(context))
+        } else if !context.is_empty() {
+            Ok(EddsaVariant::Ctx(context))
+        } else {
+            Ok(EddsaVariant::Plain)
+        }
     }
-    Ok(())
 }
 
 /// Builds an `Ed25519Key` for signing from a `CKO_PRIVATE_KEY` `Object`'s
@@ -170,6 +214,8 @@ pub struct EddsaOperation {
     in_use: bool,
     /// The key material (private for signing, public for verification).
     key: EddsaKey,
+    /// Which RFC 8032 variant to sign/verify with (see `check_params`).
+    variant: EddsaVariant,
     /// Accumulates the message as it streams in via `sign_update`/
     /// `verify_update` -- Ed25519 (pure) has no incremental primitive, so
     /// the full message must be buffered before the single `sign`/`verify`
@@ -192,7 +238,7 @@ impl EddsaOperation {
         key: &Object,
         signature: Option<Vec<u8>>,
     ) -> Result<EddsaOperation> {
-        check_params(mech)?;
+        let variant = check_params(mech)?;
         if let Some(sig) = &signature {
             validate_signature_len(sig)?;
         }
@@ -207,6 +253,7 @@ impl EddsaOperation {
             finalized: false,
             in_use: false,
             key: material,
+            variant,
             buffer: Vec::new(),
             signature,
             #[cfg(feature = "fips")]
@@ -334,7 +381,13 @@ impl Sign for EddsaOperation {
         #[cfg(feature = "fips")]
         self.fips_approval.clear();
 
-        let sig = key.sign(&self.buffer);
+        let sig = match &self.variant {
+            EddsaVariant::Plain => key.sign(&self.buffer),
+            #[cfg(not(feature = "fips"))]
+            EddsaVariant::Ctx(ctx) => key.sign_ctx(&self.buffer, ctx)?,
+            #[cfg(not(feature = "fips"))]
+            EddsaVariant::Ph(ctx) => key.sign_ph(&self.buffer, ctx)?,
+        };
 
         #[cfg(feature = "fips")]
         self.fips_approval.finalize();
@@ -407,7 +460,19 @@ impl EddsaOperation {
         #[cfg(feature = "fips")]
         self.fips_approval.clear();
 
-        Ed25519Key::verify(public, &self.buffer, &sig_arr)?;
+        match &self.variant {
+            EddsaVariant::Plain => {
+                Ed25519Key::verify(public, &self.buffer, &sig_arr)?
+            }
+            #[cfg(not(feature = "fips"))]
+            EddsaVariant::Ctx(ctx) => {
+                Ed25519Key::verify_ctx(public, &self.buffer, &sig_arr, ctx)?
+            }
+            #[cfg(not(feature = "fips"))]
+            EddsaVariant::Ph(ctx) => {
+                Ed25519Key::verify_ph(public, &self.buffer, &sig_arr, ctx)?
+            }
+        };
 
         #[cfg(feature = "fips")]
         self.fips_approval.finalize();
