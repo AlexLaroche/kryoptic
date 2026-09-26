@@ -55,7 +55,7 @@ jobs:
             OPTS="${OPTS} --target i686-unknown-linux-gnu"
           fi
 
-          cargo build -vv --all $OPTS
+          cargo build -vv --workspace --exclude awslc-fips $OPTS
           tools/softhsm/test.sh
 
       - uses: actions/upload-artifact@v4
@@ -105,7 +105,7 @@ jobs:
 
       - name: Build & test
         run: |
-          cargo build -vv --features profiles --all
+          cargo build -vv --features profiles --workspace --exclude awslc-fips
           tools/profiles/test.sh --debug
 
       - uses: actions/upload-artifact@v4

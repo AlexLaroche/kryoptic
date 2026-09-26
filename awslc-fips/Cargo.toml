@@ -1,0 +1,12 @@
+[package]
+name = "awslc-fips"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+aws-lc-fips-sys = "0.14"
+
+[build-dependencies]
+cc = "1"

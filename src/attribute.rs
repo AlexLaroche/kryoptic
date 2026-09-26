@@ -17,8 +17,6 @@ use crate::pkcs11::*;
 #[cfg(feature = "nssdb")]
 use crate::pkcs11::vendor::nss::*;
 
-use ossl::BorrowedReference;
-
 /// List of attribute types we understand
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum AttrType {
@@ -910,6 +908,16 @@ impl<'a> std::ops::Deref for RemovedAttr<'a> {
     fn deref(&self) -> &Self::Target {
         &self.0
     }
+}
+
+/// Holds a reference to data we need to keep around for the life of a
+/// CkAttrs array (a pointer to it is stored in a CK_ATTRIBUTE). Backend-
+/// independent — this is PKCS#11 attribute bookkeeping, not crypto.
+#[derive(Debug)]
+enum BorrowedReference<'a> {
+    CharBool(&'a CK_BBOOL),
+    Slice(&'a [u8]),
+    Ulong(&'a CK_ULONG),
 }
 
 /// Helper object to represent managed arrays of CK_ATTRIBUTEs

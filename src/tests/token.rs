@@ -315,6 +315,7 @@ fn test_interface_invalid_version() {
 
 #[test]
 #[serial]
+#[cfg(any(feature = "sqlitedb", feature = "nssdb"))]
 fn test_config_multiple_tokens() {
     let name = String::from("test_config_multiple");
     let confname = format!("{}/{}.conf", TESTDIR, name);
