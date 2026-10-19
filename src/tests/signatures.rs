@@ -830,3 +830,97 @@ fn test_sign_final_buffer_too_small_reports_required_len() {
 
     testtokn.finalize();
 }
+
+/// C_Verify and C_VerifyFinal terminate the verification operation also
+/// when they reject the signature length with CKR_SIGNATURE_LEN_RANGE
+#[cfg(feature = "hmac")]
+#[test]
+#[parallel]
+fn test_verify_len_range_terminates_operation() {
+    let mut testtokn = TestToken::initialized(
+        "test_verify_len_range_terminates_operation",
+        None,
+    );
+    let session = testtokn.get_session(false);
+
+    /* login */
+    testtokn.login();
+
+    let key = ret_or_panic!(import_object(
+        session,
+        CKO_SECRET_KEY,
+        &[(CKA_KEY_TYPE, CKK_GENERIC_SECRET)],
+        &[(CKA_VALUE, &[0x5au8; 32])],
+        &[(CKA_SIGN, true), (CKA_VERIFY, true)],
+    ));
+    let mut mechanism: CK_MECHANISM = CK_MECHANISM {
+        mechanism: CKM_SHA256_HMAC,
+        pParameter: std::ptr::null_mut(),
+        ulParameterLen: 0,
+    };
+    let data = b"data";
+    let mut signature = ret_or_panic!(sig_gen(session, key, data, &mechanism));
+    let mut short_sig = [0u8; 1];
+
+    /* C_Verify */
+    let ret = fn_verify_init(session, &mut mechanism, key);
+    assert_eq!(ret, CKR_OK);
+    let ret = fn_verify(
+        session,
+        byte_ptr!(data),
+        data.len() as CK_ULONG,
+        short_sig.as_mut_ptr(),
+        short_sig.len() as CK_ULONG,
+    );
+    assert_eq!(ret, CKR_SIGNATURE_LEN_RANGE);
+    let ret = fn_verify(
+        session,
+        byte_ptr!(data),
+        data.len() as CK_ULONG,
+        signature.as_mut_ptr(),
+        signature.len() as CK_ULONG,
+    );
+    assert_eq!(ret, CKR_OPERATION_NOT_INITIALIZED);
+    let ret = fn_verify_init(session, &mut mechanism, key);
+    assert_eq!(ret, CKR_OK);
+    let ret = fn_verify(
+        session,
+        byte_ptr!(data),
+        data.len() as CK_ULONG,
+        signature.as_mut_ptr(),
+        signature.len() as CK_ULONG,
+    );
+    assert_eq!(ret, CKR_OK);
+
+    /* C_VerifyFinal */
+    let ret = fn_verify_init(session, &mut mechanism, key);
+    assert_eq!(ret, CKR_OK);
+    let ret =
+        fn_verify_update(session, byte_ptr!(data), data.len() as CK_ULONG);
+    assert_eq!(ret, CKR_OK);
+    let ret = fn_verify_final(
+        session,
+        short_sig.as_mut_ptr(),
+        short_sig.len() as CK_ULONG,
+    );
+    assert_eq!(ret, CKR_SIGNATURE_LEN_RANGE);
+    let ret = fn_verify_final(
+        session,
+        signature.as_mut_ptr(),
+        signature.len() as CK_ULONG,
+    );
+    assert_eq!(ret, CKR_OPERATION_NOT_INITIALIZED);
+    let ret = fn_verify_init(session, &mut mechanism, key);
+    assert_eq!(ret, CKR_OK);
+    let ret =
+        fn_verify_update(session, byte_ptr!(data), data.len() as CK_ULONG);
+    assert_eq!(ret, CKR_OK);
+    let ret = fn_verify_final(
+        session,
+        signature.as_mut_ptr(),
+        signature.len() as CK_ULONG,
+    );
+    assert_eq!(ret, CKR_OK);
+
+    testtokn.finalize();
+}

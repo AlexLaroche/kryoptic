@@ -388,13 +388,16 @@ fn verify(
     let rstate = STATE.rlock()?;
     let mut session = rstate.get_session_mut(s_handle)?;
     let slot_id = session.get_slot_id();
-    let operation = session.get_operation::<dyn Verify>()?;
-    let signature_len = operation.signature_len()?;
+    let signature_len =
+        session.get_operation::<dyn Verify>()?.signature_len()?;
     let sig_len =
         CK_ULONG::try_from(signature_len).map_err(|_| CKR_GENERAL_ERROR)?;
     if psignature_len != sig_len {
+        /* the call terminates the operation, even on this error */
+        session.cancel_operation::<dyn Verify>()?;
         return Err(CKR_SIGNATURE_LEN_RANGE)?;
     }
+    let operation = session.get_operation::<dyn Verify>()?;
     let dlen = usize::try_from(data_len).map_err(|_| CKR_ARGUMENTS_BAD)?;
     let data: &[u8] = bytes_to_slice(pdata, dlen);
     let signature: &[u8] = bytes_to_slice(psignature, signature_len);
@@ -505,13 +508,16 @@ fn verify_final(
     let rstate = STATE.rlock()?;
     let mut session = rstate.get_session_mut(s_handle)?;
     let slot_id = session.get_slot_id();
-    let operation = session.get_operation::<dyn Verify>()?;
-    let signature_len = operation.signature_len()?;
+    let signature_len =
+        session.get_operation::<dyn Verify>()?.signature_len()?;
     let sig_len =
         CK_ULONG::try_from(signature_len).map_err(|_| CKR_GENERAL_ERROR)?;
     if psignature_len != sig_len {
+        /* the call terminates the operation, even on this error */
+        session.cancel_operation::<dyn Verify>()?;
         return Err(CKR_SIGNATURE_LEN_RANGE)?;
     }
+    let operation = session.get_operation::<dyn Verify>()?;
     let signature: &mut [u8] = bytes_to_slice_mut(psignature, signature_len)?;
     operation.verify_final(signature)?;
 
